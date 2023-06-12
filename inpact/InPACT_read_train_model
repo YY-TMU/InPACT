@@ -1,0 +1,242 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import random
+import joblib
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+import sklearn.metrics as skm
+from sklearn.ensemble import RandomForestClassifier
+from imblearn.ensemble import BalancedBaggingClassifier
+
+
+# logging
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+# create new directory
+def createDir(dir_file):
+    if not os.path.exists(dir_file):
+        os.makedirs(dir_file,
+                    exist_ok=True)
+    return
+
+# extract 20% to test
+def splitTest(train_file,
+              select_feat = False,
+              group_name = "class",
+              train_fraction = 0.8,
+              seed = False,
+              shuffle = False):
+    rt_total = pd.read_table(train_file,index_col="region")
+    if select_feat:
+        rt_total = rt_total = rt_total.loc[:,select_feat]    
+    rt_total = rt_total.sort_index()
+    # dict of class and number
+    class_number_dic = dict(Counter(rt_total[group_name].tolist()))
+    total_number = min(class_number_dic.values())
+    train_number = int(total_number * train_fraction)
+    test_nubmer = total_number - train_number
+
+    # dict of class and reigons
+    class_total_region_dic = dict()
+    for cl in class_number_dic:
+        cl_region = rt_total[group_name].isin([cl])
+        class_total_region_dic[cl] = cl_region.index[cl_region]
+
+    # random sampling from three group
+    test_regions = []
+    rest_regions = []
+    for cl,cl_regions in class_total_region_dic.items():
+        if seed:
+            random.seed(int(seed))
+        sample_regions = random.sample(list(cl_regions),test_nubmer)
+        test_regions.extend(sample_regions)
+        rest_region = list(set(cl_regions) - set(sample_regions))
+        rest_regions.extend(rest_region)
+    if shuffle:
+        random.shuffle(test_regions)
+        random.shuffle(rest_regions)
+    else:
+        test_regions = sorted(test_regions)
+        rest_regions = sorted(rest_regions)
+    rt_test = rt_total.loc[test_regions,]
+    log.info("Test number : %d" % (len(test_regions)))
+    rt_rest = rt_total.loc[rest_regions,]
+    log.info("Rest number : %d" % (len(rest_regions)))
+    return rt_test,rt_rest
+
+#build model
+def buildModel(rt_train,
+               random_seed):
+    features = rt_train.columns
+    rt_train_x = rt_train.loc[:,features[:-1]]
+    rt_train_y = rt_train.loc[:,features[-1]]
+    # training 
+    ml = BalancedBaggingClassifier(base_estimator = RandomForestClassifier(n_estimators=100,
+                                                                           criterion="gini"),
+                                  n_estimators = 10,                                 
+                                  sampling_strategy = "not minority",
+                                  bootstrap=False,
+                                  random_state = random_seed,
+                                  n_jobs = 3,
+                                  verbose = 1)
+    ml.fit(rt_train_x,rt_train_y)
+    return ml
+
+# model evaluation
+def trueNegative(y_true,y_pred):
+    labels = ['terminal', 'intermediate', 'background']
+    cm = pd.DataFrame(skm.confusion_matrix(y_true, y_pred,labels=labels),
+                      index = labels,columns=labels)
+    # get label weights
+    label_weighs = (cm.sum(axis=1)/cm.sum(axis=1).sum()).to_dict()
+    # calculate 
+    FP = cm.sum(axis=0) - np.diag(cm)
+    FN = cm.sum(axis=1) - np.diag(cm)
+    TP = np.diag(cm)
+    TN = cm.sum().sum() - (FP + FN + TP)
+    # TNR
+    TNR_ave = 0
+    TNR = TN/(TN+FP) 
+    TNR_dic = TNR.to_dict()
+    for cl,v in TNR_dic.items():
+        TNR_ave += v * label_weighs[cl]
+    return TNR_ave
+
+def modelEva(rt_test,
+             model,
+             model_performance_file):
+    features = rt_test.columns
+    # split test
+    x_test = rt_test.loc[:,features[:-1]]
+    y_test = rt_test.loc[:,features[-1]]
+    # prediction
+    y_pred = model.predict(x_test)
+    # calculate
+    accuracy = skm.accuracy_score(y_test,y_pred)
+    precision = skm.precision_score(y_test,y_pred,average="weighted")
+    tpr = skm.recall_score(y_test,y_pred,average="weighted")
+    f1 = skm.f1_score(y_test,y_pred,average="weighted")
+    tnr = trueNegative(y_test,y_pred)
+    y_pred_prob = model.predict_proba(x_test)
+    auc = skm.roc_auc_score(y_test, y_pred_prob, multi_class='ovr')
+    test_performance = pd.DataFrame([accuracy,precision,tpr,tnr,f1,auc],
+                                    index = ["ACC","PSC","TPR","TNR","F1","AUC"],
+                                    columns = ["value"]).T
+    # save file
+    test_performance.to_csv(model_performance_file,sep="\t",index_label="Index")
+    log.info("Save " + model_performance_file)
+    return features
+
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Train the model to identify terminal exon.')
+    # input and output
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--sample_dir',
+            type = str,
+            help='Directory that contains the feat file.')
+    g.add_argument(
+            '--train_fraction',
+            help='Fraction of samle to train',
+            type=float,
+            default=0.8)
+    g.add_argument(
+            '--random_seed',
+            help='Float/False',
+            default=888)
+    g = p.add_argument_group('output')
+    g.add_argument(
+            '--save_dir',
+            type = str,
+            help='Output directory')
+    g.add_argument(
+            '--save_skip_model',
+            type = str,
+            help='Save skip model')
+    g.add_argument(
+            '--save_composite_model',
+            type = str,
+            help='Save composite model')
+    return p
+
+
+# parse args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+log.info("#"*25 + "Start : Training model" + "#"*25)
+log.info("Parameters:")
+log.info(args)
+log.info("-"*30)
+# parameter
+composite_feat = ["Coverage_cov",
+                  "Zero_weight",
+                  "Relative_length",
+                  "Entropy_efficiency",
+                  "Splice_three_border_ratio",
+                  "Unspliced_three_site_ratio",
+                  "Splice_three_all_ratio",
+                  "Expression_ratio",
+                  "class"]
+sample_dir = args.sample_dir
+all_training_feat_file = os.path.join(sample_dir,
+                                      "1.training_data/4.all.training.feat.txt")
+train_fraction = args.train_fraction
+random_seed = args.random_seed
+# output
+build_model_dir = args.save_dir
+build_model_dir = os.path.join(sample_dir,build_model_dir)
+# skip
+skip_model_performance_file = "1.skip.model.performance.txt"
+skip_model_performance_file = os.path.join(build_model_dir,skip_model_performance_file)
+skip_model_file = args.save_skip_model
+skip_model_file = os.path.join(build_model_dir,skip_model_file)
+# composite
+composite_model_performance_file = "2.composite.model.performance.txt"
+composite_model_performance_file = os.path.join(build_model_dir,composite_model_performance_file)
+composite_model_file = args.save_composite_model
+composite_model_file = os.path.join(build_model_dir,composite_model_file)
+#run
+createDir(build_model_dir)
+# skip
+log.info("Processing skip..." )
+rt_test_skip,rt_rest_skip = splitTest(all_training_feat_file,
+                                      train_fraction = train_fraction,
+                                      seed = random_seed)
+ml_skip = buildModel(rt_rest_skip,random_seed)
+features_skip = modelEva(rt_test_skip,
+                         ml_skip,
+                         skip_model_performance_file)
+# save model
+joblib.dump(ml_skip,skip_model_file)
+log.info("Save " + skip_model_file)
+# composite
+log.info("Processing composite..." )
+rt_test_composite,rt_rest_composite = splitTest(all_training_feat_file,
+                                                select_feat = composite_feat,
+                                                train_fraction = train_fraction,
+                                                seed = random_seed)
+ml_composite = buildModel(rt_rest_composite,random_seed)
+features_composite = modelEva(rt_test_composite,
+                              ml_composite,
+                              composite_model_performance_file)
+# save model
+joblib.dump(ml_composite,composite_model_file)
+log.info("Save " + composite_model_file)
+log.info("#"*25 + "Done : Training model" + "#"*25 + "\n\n")
+
+
+

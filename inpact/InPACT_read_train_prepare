@@ -1,0 +1,987 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import json
+import random
+import HTSeq
+import argparse
+import logging
+import numpy as np
+import pandas as pd
+from collections import Counter
+from multiprocessing import Pool
+
+# logging
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+def mkDir(dir_file):
+    if not os.path.exists(dir_file):
+        os.makedirs(dir_file,
+                    exist_ok=True)
+    return
+
+def readJson(jsonfile):
+    with open(jsonfile,'r') as f:
+        json_dic = json.loads(f.read())
+    return json_dic
+
+def extractIvToDic(bedfile):
+    log.info("Extract interval from %s to dict." % (bedfile))
+    exon_gene_dic = dict()
+    with open(bedfile) as target_exon:
+        for exon in target_exon:
+            exon_sp = exon.strip().split("\t")
+            exon_iv = HTSeq.GenomicInterval(exon_sp[0],
+                                            int(exon_sp[1]),
+                                            int(exon_sp[2]),
+                                            exon_sp[5])
+            exon_gene_dic[exon_iv] = exon_sp[3]
+    return exon_gene_dic
+
+class AlignmentInfo:
+    def __init__(self, align):
+        self.align = align
+        self.split_events = list()
+        self.regions = set()
+        self.cross_border = False
+        
+class AlignmentSplit:
+    def __init__(self, chromosome, strand, five_site):
+        self.chromosome = chromosome
+        self.strand = strand
+        self.five_site = five_site
+        self.three_site = None
+
+class exonUnit:
+    def __init__(self,exon):
+        self.exon = exon
+        self.unspliced_five_site = 0
+        self.unspliced_three_site = 0
+        self.splice_three_all = 0
+        self.splice_three_border = 0
+        self.splice_five_all = 0
+        self.splice_five_border = 0
+        self.full_profile = HTSeq.GenomicArray("auto", stranded=True, typecode="i")
+        self.exon_profile = None         
+        
+class CalculateRead(object):
+    def __init__(
+        self,
+        interval_info,
+        annotation,
+        gene_name,
+        splice_five_all,
+        splice_five_border,
+        splice_three_all,
+        splice_three_border,
+        unspliced_five_site,
+        unspliced_three_site,
+        profile
+    ):
+        self.interval_info = interval_info
+        self.annotation = annotation
+        self.gene_name = gene_name
+        self.splice_five_all = splice_five_all
+        self.splice_five_border = splice_five_border
+        self.splice_three_all = splice_three_all
+        self.splice_three_border = splice_three_border
+        self.unspliced_five_site = unspliced_five_site
+        self.unspliced_three_site = unspliced_three_site
+        self.profile = profile
+        self.total_reads = None
+        self.exon_length = None
+        self.gene_expression = None
+
+    def to_dict(self):
+        return {
+            'region': self.interval_info,
+            'annotation': self.annotation,
+            'gene_name': self.gene_name,
+            'splice_five_all': self.splice_five_all,
+            'splice_five_border': self.splice_five_border,
+            'splice_three_all': self.splice_three_all,
+            'splice_three_border': self.splice_three_border,
+            'unspliced_five_site': self.unspliced_five_site,
+            'unspliced_three_site': self.unspliced_three_site,
+            'profile': self.profile,
+            'total_reads': self.total_reads,
+            'exon_length': self.exon_length,
+            'gene_expression':self.gene_expression
+        }
+        
+def assessInterval(genomic_interval,alignment_info,min_overlap,genomic_array_set):
+    regions = set()
+    for interval,intersection in genomic_array_set[genomic_interval].steps():
+        if len(intersection) == 1:
+            if interval.length >= min_overlap:
+                matched_region = next(iter(intersection))
+                alignment_info.regions.add(matched_region)
+                regions.add(matched_region)
+        elif len(intersection) > 1:
+            raise Exception("ERROR: norm_region and feat_region seem to overlap!")
+    if len(regions) > 1:
+        alignment_info.cross_border = True
+
+
+def handleAlign(align,
+                interval_unit,
+                genomic_array_set,
+                min_overlap, 
+                count_unique,
+                cal_profile = True):
+    if count_unique and (not align.optional_field("NH") == 1):
+        return 0
+    exon_interval = interval_unit.exon
+    if exon_interval.strand is not align.iv.strand:
+        align.iv.strand = exon_interval.strand
+        for cigar in align.cigar:
+            cigar.ref_iv.strand = exon_interval.strand   
+    alignment_info = AlignmentInfo(align=align)
+    genomic_interval = None
+    alignment_split = None    
+    if align.iv.strand == "+":
+        cigar_list = align.cigar
+    elif align.iv.strand == "-":
+        cigar_list = list(reversed(align.cigar))
+    else:
+        raise Exception("ERROR: unknown strand in alignment!")    
+    for cigar in cigar_list:
+        if cigar.type == "M":
+            if genomic_interval is None:
+                genomic_interval = cigar.ref_iv
+            else:
+                genomic_interval.extend_to_include(cigar.ref_iv)
+            if cal_profile:
+                interval_unit.full_profile[cigar.ref_iv] += 1
+        elif cigar.type == "N":
+            if alignment_split is None:
+                if align.iv.strand == "+":
+                    alignment_split = AlignmentSplit(
+                        chromosome = genomic_interval.chrom,
+                        strand = genomic_interval.strand,
+                        five_site = genomic_interval.end)
+                elif align.iv.strand == "-":
+                    alignment_split = AlignmentSplit(
+                        chromosome = genomic_interval.chrom,
+                        strand = genomic_interval.strand,
+                        five_site = genomic_interval.start)
+            else:
+                if align.iv.strand == "+":
+                    alignment_split.three_site = \
+                        genomic_interval.start
+                elif align.iv.strand == "-":
+                    alignment_split.three_site = \
+                        genomic_interval.end
+                alignment_info.split_events.append(alignment_split)
+                alignment_split = None
+                if align.iv.strand == "+":
+                    alignment_split = AlignmentSplit(
+                        chromosome = genomic_interval.chrom,
+                        strand = genomic_interval.strand,
+                        five_site = genomic_interval.end)
+                elif align.iv.strand == "-":
+                    alignment_split = AlignmentSplit(
+                        chromosome = genomic_interval.chrom,
+                        strand = genomic_interval.strand,
+                        five_site = genomic_interval.start)
+            assessInterval(genomic_interval,
+                           alignment_info,
+                           min_overlap,
+                           genomic_array_set)
+            genomic_interval = None
+    if genomic_interval is not None:
+        if alignment_split is not None:
+            if align.iv.strand == "+":
+                alignment_split.three_site = \
+                    genomic_interval.start
+            elif align.iv.strand == "-":
+                alignment_split.three_site = \
+                    genomic_interval.end
+            alignment_info.split_events.append(alignment_split)
+            alignment_split = None
+        assessInterval(genomic_interval,
+                       alignment_info,
+                       min_overlap,
+                       genomic_array_set)
+        genomic_interval = None
+    else:
+        raise Exception("ERROR: Weird case, check it!")
+    return alignment_info
+
+def filterFeature(interval_unit,
+                  bam,
+                  region_type,
+                  min_overlap,
+                  count_unique):
+    exon_interval = interval_unit.exon    
+    genomic_array_set = HTSeq.GenomicArrayOfSets("auto", stranded=True)
+    genomic_array_set[exon_interval] += region_type   
+    region_location = exon_interval.chrom + ":" + str(exon_interval.start) + "-" + str(exon_interval.end)
+    for align in bam.fetch(region=region_location):
+        if align.aligned:
+            alignment_info = handleAlign(align,
+                                         interval_unit,
+                                         genomic_array_set,
+                                         min_overlap,
+                                         count_unique)
+            if alignment_info:
+                region_set = alignment_info.regions
+                if len(region_set) == 1:
+                    if len(alignment_info.split_events) == 0:
+                        if alignment_info.align.iv.strand == '+':
+                            if (
+                                int(alignment_info.align.iv.start) < int(exon_interval.end) and
+                                int(alignment_info.align.iv.end) > int(exon_interval.end)
+                            ):
+                                interval_unit.unspliced_three_site += 1
+                        elif alignment_info.align.iv.strand == '-':
+                            if (
+                                int(alignment_info.align.iv.start) < int(exon_interval.start) and
+                                int(alignment_info.align.iv.end) > int(exon_interval.start)
+                            ):
+
+                                interval_unit.unspliced_three_site += 1
+                    elif len(alignment_info.split_events) > 0:        
+                        for split_event in alignment_info.split_events:            
+                            if alignment_info.align.iv.strand == "+":
+                                if int(exon_interval.start) == int(split_event.three_site):
+                                    interval_unit.splice_five_border += 1
+                            elif alignment_info.align.iv.strand == "-":
+                                if int(split_event.three_site) == int(exon_interval.end):
+                                    interval_unit.splice_five_border += 1
+    return
+
+def filterTeIv(te_interval,
+               bam,
+               region_type,
+               check_last_base,
+               threshold_to_filter,
+               min_overlap,
+               count_unique,               
+               coverage_threshold):
+    try:
+        exon_group_dic = dict()
+        te_interval_unit = exonUnit(te_interval)
+        strand = te_interval.strand
+        filterFeature(te_interval_unit,
+                      bam,
+                      region_type,
+                      min_overlap,
+                      count_unique)
+        exon_profile = list(int(x) for x in list(te_interval_unit.full_profile[te_interval_unit.exon]))
+        region_length = len(exon_profile)
+        zero_number = Counter(exon_profile)[0]
+        coverage_proportion = 1 - (zero_number/region_length)
+        if strand == "-":
+            exon_profile = exon_profile[::-1]
+        te_interval_unit.exon_profile = exon_profile
+        last_base_count = exon_profile[-check_last_base:]
+        last_base_count = sum([int(i) for i in last_base_count])
+        if (te_interval_unit.splice_five_border >= threshold_to_filter) and \
+           (te_interval_unit.unspliced_three_site == 0) and \
+           (last_base_count > 0) and \
+           (coverage_proportion >= coverage_threshold):
+            exon_group_dic[te_interval_unit] = "terminal"
+        if (te_interval_unit.splice_five_border < threshold_to_filter) and \
+           (te_interval_unit.splice_five_border > 0):
+            exon_group_dic[te_interval_unit] = "backgroud"
+        return exon_group_dic
+    except Exception as e:
+        logging.exception(e)
+        sys.exit(1)
+        return 0
+
+
+def filterIntermediateIv(inter_interval,
+                         bam,
+                         region_type,
+                         check_last_base,
+                         threshold_to_filter,
+                         min_overlap,
+                         count_unique,
+                         coverage_threshold):
+    try:
+        exon_group_dic = dict()
+        inter_interval_unit = exonUnit(inter_interval)
+        strand = inter_interval.strand
+        filterFeature(inter_interval_unit,
+                      bam,
+                      region_type,
+                      min_overlap,
+                      count_unique)
+        exon_profile = list(int(x) for x in list(inter_interval_unit.full_profile[inter_interval]))
+        if strand == "-":
+            exon_profile = exon_profile[::-1]
+        inter_interval_unit.exon_profile = exon_profile
+        last_base_count = exon_profile[-check_last_base:]
+        last_base_count = sum([int(i) for i in last_base_count])
+        if (inter_interval_unit.splice_five_border >= threshold_to_filter) and \
+           (last_base_count > 0):
+            exon_group_dic[inter_interval_unit] = region_type
+        return exon_group_dic
+    except Exception as e:
+        logging.exception(e)
+        sys.exit(1)
+        return 0
+    
+def filterByExp(bam_file_path,
+                exon_gene_dic,
+                filterfun,
+                group,
+                region_type,
+                check_last_base,
+                threshold_to_filter,
+                min_overlap,
+                count_unique,
+                coverage_threshold):
+    log.info("Filter %s ......" % region_type)
+    bam = HTSeq.BAM_Reader(bam_file_path)
+    filtered_exon_group = dict()
+    exon_iv_lss = []
+    exon_ivs = list(exon_gene_dic.keys())
+    exon_iv_number = len(exon_ivs)
+    step = int(exon_iv_number / group) + 1
+    for i in range(0, exon_iv_number, step):
+        exon_iv_lss.append(exon_ivs[i: i + step])
+    i = 0
+    for exon_iv_ls in exon_iv_lss:
+        pool = Pool(group)
+        for exon_iv in exon_iv_ls:
+            pool.apply_async(filterfun,(exon_iv,
+                                        bam,
+                                        region_type,
+                                        check_last_base,
+                                        threshold_to_filter,
+                                        min_overlap,
+                                        count_unique,
+                                        coverage_threshold),
+                            callback = filtered_exon_group.update)
+            i += 1
+        pool.close()
+        pool.join()
+        log.info("Processing : %d/%d" % (i,exon_iv_number))
+    return filtered_exon_group
+
+def countAlignment(alignment_info,
+                   interval_unit):
+    iv = interval_unit.exon
+    region_set = alignment_info.regions
+    if len(region_set) == 1:
+        if len(alignment_info.split_events) == 0:
+            if alignment_info.align.iv.strand == '+':
+                if (
+                    int(alignment_info.align.iv.start) <
+                    int(iv.start) and
+                    int(alignment_info.align.iv.end) >
+                    int(iv.start)
+                ):
+                    interval_unit.unspliced_five_site += 1
+
+            elif alignment_info.align.iv.strand == '-':
+                if (
+                    int(alignment_info.align.iv.start) <
+                    int(iv.end) and
+                    int(alignment_info.align.iv.end) >
+                    int(iv.end)
+                ):
+
+                    interval_unit.unspliced_five_site += 1
+        elif len(alignment_info.split_events) > 0:
+
+            for split_event in alignment_info.split_events:
+
+                if alignment_info.align.iv.strand == "+":
+                    if (
+                        int(split_event.five_site) >=
+                        int(iv.start) and
+                        int(split_event.five_site) <=
+                        int(iv.end) and
+                        int(split_event.three_site) >=
+                        int(iv.end) and
+                        int(split_event.three_site) >=
+                        int(iv.start)
+                    ):
+                        interval_unit.splice_three_all += 1
+                    if int(split_event.five_site) == int(iv.end):
+
+                        interval_unit.splice_three_border += 1
+                    if (
+                        int(split_event.three_site) >=
+                        int(iv.start) and
+                        int(split_event.three_site) <=
+                        int(iv.end) and
+                        int(split_event.five_site) <= 
+                        int(iv.start) and 
+                        int(split_event.five_site) <=
+                        int(iv.end)
+                    ):
+
+                        interval_unit.splice_five_all  += 1
+
+
+                elif alignment_info.align.iv.strand == "-":
+                    if (
+                        int(split_event.five_site) >=
+                        int(iv.start) and
+                        int(split_event.five_site) <=
+                        int(iv.end) and
+                        int(split_event.three_site) <=
+                        int(iv.start) and
+                        int(split_event.three_site) <=
+                        int(iv.end)
+                    ):
+
+                        interval_unit.splice_three_all += 1
+
+                    if int(split_event.five_site) == int(iv.start):
+
+                        interval_unit.splice_three_border += 1
+                    if (
+                        int(split_event.three_site) >=
+                        int(iv.start) and
+                        int(split_event.three_site) <=
+                        int(iv.end) and 
+                        int(split_event.five_site) >=
+                        int(iv.start) and
+                        int(split_event.five_site) >=
+                        int(iv.end)
+                    ):
+                        interval_unit.splice_five_all  += 1
+    return
+
+    
+def filterTerminalResult(bam_file_path,
+                         terminal_exon_gene_dic,
+                         group,                     
+                         region_type,
+                         check_last_base,
+                         threshold_to_filter,
+                         min_overlap,
+                         count_unique,
+                         coverage_threshold):
+    te_filtered_exon_group = filterByExp(bam_file_path,
+                                         terminal_exon_gene_dic,
+                                         filterTeIv,
+                                         group,
+                                         region_type,
+                                         check_last_base,
+                                         threshold_to_filter,
+                                         min_overlap,
+                                         count_unique,
+                                         coverage_threshold)
+    # result
+    annotated_terminal_exons = list()
+    background_terminal_exons = list()
+    for k,v in te_filtered_exon_group.items():
+        if v == "terminal":
+            annotated_terminal_exons.append(k)
+        elif v == "backgroud":
+            background_terminal_exons.append(k)
+    return annotated_terminal_exons,background_terminal_exons
+    
+def exonGetFeature(interval_unit,
+                   bam,
+                   exon_gene_dic,
+                   region_type,
+                   count_unique,
+                   min_overlap):
+    exon_interval = interval_unit.exon
+    genomic_array_set = HTSeq.GenomicArrayOfSets("auto", stranded=True)
+    genomic_array_set[exon_interval] += region_type   
+    region_location = exon_interval.chrom + ":" + str(exon_interval.start) + "-" + str(exon_interval.end)
+    for align in bam.fetch(region=region_location): 
+        if align.aligned:
+            alignment_info = handleAlign(align,
+                                         interval_unit,
+                                         genomic_array_set,
+                                         min_overlap, 
+                                         count_unique,
+                                         cal_profile = False)
+            if alignment_info:
+                countAlignment(alignment_info,interval_unit)
+    chrom = exon_interval.chrom
+    start = exon_interval.start
+    end = exon_interval.end
+    strand = exon_interval.strand
+    profile = interval_unit.exon_profile
+    profile = str(",".join(str(x) for x in profile))
+    read_summary = CalculateRead(interval_info = str(":".join([chrom,str(int(start) + 1),str(end),strand])),
+                                 annotation = region_type,
+                                 gene_name = exon_gene_dic[exon_interval],
+                                 splice_five_all = interval_unit.splice_five_all,
+                                 splice_five_border = interval_unit.splice_five_border,
+                                 splice_three_all = interval_unit.splice_three_all,
+                                 splice_three_border = interval_unit.splice_three_border,
+                                 unspliced_five_site = interval_unit.unspliced_five_site,
+                                 unspliced_three_site = interval_unit.unspliced_three_site,
+                                 profile = profile)
+    return read_summary
+
+def getFeatures(exon_unit_ls,
+                bam_file_path,
+                exon_gene_dic,
+                region_type,
+                group,
+                count_unique,
+                min_overlap):
+    log.info("Extract feature of " + region_type)
+    bam = HTSeq.BAM_Reader(bam_file_path)
+    features = []
+    exon_unit_group = []
+    exon_unit_number = len(exon_unit_ls)
+    step = int(exon_unit_number / group) + 1
+    for i in range(0, exon_unit_number, step):
+        exon_unit_group.append(exon_unit_ls[i: i + step])
+    i = 0
+    for exon_units in exon_unit_group:
+        pool = Pool(group)
+        for exon_unit in exon_units:
+            pool.apply_async(exonGetFeature,(exon_unit,
+                                             bam,
+                                             exon_gene_dic,
+                                             region_type,
+                                             count_unique,
+                                             min_overlap),
+                             callback = features.append)
+            i += 1
+        pool.close()
+        pool.join()
+        log.info("Processing : %d/%d" % (i,exon_unit_number))
+    return features
+
+def extractGeneFeature(feature_ls):
+    genes = []
+    for feature in feature_ls:
+        genes.append(feature.gene_name)
+    return genes
+
+def getIntermediateDic(intermediate_not_overlap_start_terminal,
+                       terminal_exon_features,
+                       background_exon_features,
+                       terminal_same_gene = True,
+                       limit_inter_number = True,
+                       seed = False):
+    intermediate_exon_gene_dic = extractIvToDic(intermediate_not_overlap_start_terminal)
+    log.info("Total intermediate : %d" % len(intermediate_exon_gene_dic))
+    background_genes = extractGeneFeature(background_exon_features)
+    background_number = len(background_genes)
+    terminal_genes = extractGeneFeature(terminal_exon_features)
+    terminal_number = len(terminal_genes)
+    if terminal_same_gene:
+        log.info("Extract intermediate exons that have the same gene")
+        genes = list(set(background_genes + terminal_genes))
+        intermediate_exon_gene_select_dic = dict()
+        for k,v in intermediate_exon_gene_dic.items():
+            if v in genes:
+                intermediate_exon_gene_select_dic[k] = v
+        intermediate_exon_gene_dic = intermediate_exon_gene_select_dic
+        log.info("Filtered intermediate(same gene) : %d" % len(intermediate_exon_gene_dic))
+    if limit_inter_number:
+        te_minimum_number = min([terminal_number,background_number])
+        intermediate_number = len(intermediate_exon_gene_dic)
+        require_number = te_minimum_number * 10
+        if intermediate_number > require_number:
+            # random sample
+            inter_ivs = list(zip(list(intermediate_exon_gene_dic.keys()),
+                                 list(intermediate_exon_gene_dic.values())))
+            if seed:
+                random.seed(int(seed))
+            filter_inter_ivs = random.sample(inter_ivs,
+                                             require_number)
+            intermediate_exon_gene_dic = dict(filter_inter_ivs)
+        log.info("Filtered intermediate(random) : %d" % len(intermediate_exon_gene_dic))
+    return intermediate_exon_gene_dic
+
+def geneIvDic(gene_interval_bed,
+              terminal_exon_feat,
+              intermediate_exon_feat,
+              background_exon_feat):
+    rt_gene_iv = pd.read_table(gene_interval_bed,header=None)
+    all_gene_iv_dic = dict()
+    for gene_info in rt_gene_iv.itertuples():
+        chromosome = gene_info._1
+        start = gene_info._2
+        end = gene_info._3
+        gene_name = gene_info._4
+        strand = gene_info._6
+        all_gene_iv_dic[gene_name] = [chromosome,start,end,strand]
+    # filter
+    terminal_genes = extractGeneFeature(terminal_exon_feat)
+    background_genes = extractGeneFeature(background_exon_feat)
+    intermediate_genes = extractGeneFeature(intermediate_exon_feat)
+    all_genes = list(set(terminal_genes + background_genes + intermediate_genes)) 
+    sl_gene_iv_dic = dict()
+    for gene in all_genes:
+        sl_gene_iv_dic[gene] = all_gene_iv_dic[gene]
+    return sl_gene_iv_dic
+
+
+def geneRead(gene_name,
+             gene_iv_dic,
+             bam,
+             union_exon_length_dic,
+             count_unique = True):
+    chromosome,start,end,strand = gene_iv_dic[gene_name]
+    region_location = chromosome + ":" + str(start) + "-" + str(end)
+    total_reads = 0
+    gene_read_dic = dict()
+    for align in bam.fetch(region=region_location):
+        if align.aligned:
+            if (
+                (count_unique) and not
+                (align.optional_field("NH") == 1)
+            ):
+                continue
+            if (
+                str(chromosome) == str(align.iv.chrom) and
+                int(start) <= int(align.iv.start) and
+                int(start) <= int(align.iv.end) and
+                int(end) >= int(align.iv.start) and
+                int(end) >= int(align.iv.end)
+            ):
+                total_reads += 1
+    read_per_base = round(total_reads/union_exon_length_dic[gene_name]*1000,3)
+    gene_read_dic[gene_name] = {"total_reads":total_reads,
+                                "read_per_base":read_per_base}
+    return gene_read_dic
+
+
+def getGeneRead(gene_iv_dic,
+                process_number,
+                bam_file_path,
+                union_exon_length_dic):
+    bam = HTSeq.BAM_Reader(bam_file_path)
+    gene_read_dic = dict()
+    genes = list(gene_iv_dic.keys())
+    gene_number = len(genes)
+    gene_lss = []
+    step = int(np.ceil(gene_number/5))
+    for i in range(0, gene_number, step):
+        gene_lss.append(genes[i:i+step])
+    i = 0
+    for gene_ls in gene_lss:
+        pool=Pool(process_number)
+        for gene_name in gene_ls:
+            pool.apply_async(geneRead,
+                             (gene_name,gene_iv_dic,bam,union_exon_length_dic),
+                             callback=gene_read_dic.update)
+            i += 1
+        pool.close()
+        pool.join()
+        log.info("Calculate the read of gene : %d/%d" % (i,gene_number))
+    return gene_read_dic 
+
+
+def writeGeneRead(features,
+                  gene_read_dic,
+                  union_exon_length_dic):
+    for feature in features:
+        gene_name = feature.gene_name
+        feature.total_reads = gene_read_dic[gene_name]["total_reads"]
+        feature.exon_length = union_exon_length_dic[gene_name]
+        feature.gene_expression = gene_read_dic[gene_name]["read_per_base"]
+    return
+
+
+def computeFeatures(info_dic):
+    region = list(info_dic.keys())[0]
+    row = info_dic[region]
+    try:        
+        profile = [int(x) for x in row["profile"].split(",")]
+        region_length = len(profile)
+        mean_coverage = np.mean(profile)
+        coverage_cov = np.array(profile).std()/(mean_coverage + np.finfo(float).eps)
+        position_weight = sum([1/x for x in range(1,region_length+1)])
+        zero_position = []
+        for i,x in enumerate(profile):
+            if x == 0:
+                zero_position.append(i+1)
+        zero_weight = sum([1/x for x in zero_position])
+        zero_weight = zero_weight/position_weight
+        probability_normalize = [x / sum(profile) for x in profile]
+        entropy_efficiency = -sum([p * np.log2(p + np.finfo(float).eps)
+                                   for p in probability_normalize]
+                                  ) / np.log2(region_length)
+        relative_region_length = region_length/row["exon_length"]
+        mean_profile_5p = \
+            (np.mean(profile[:min([20, len(profile)])]) +
+             np.finfo(float).eps)
+        mean_profile_3p = \
+            (np.mean(profile[max([-20, -len(profile)]):]) +
+             np.finfo(float).eps)
+        ratio_splice_five_border = row["splice_five_border"] / mean_profile_5p
+        ratio_splice_three_border = row["splice_three_border"] / mean_profile_3p
+        ratio_unspliced_five_site = row["unspliced_five_site"] / mean_profile_5p
+        ratio_unspliced_three_site = row["unspliced_three_site"] / mean_profile_3p
+        ratio_splice_five_all = row["splice_five_all"] / mean_profile_5p
+        ratio_splice_three_all = row["splice_three_all"] / mean_profile_3p
+        ratio_three_vs_five = ((row["splice_three_all"] + row["unspliced_three_site"]) /
+                               (row["splice_five_all"] + row["unspliced_five_site"] + np.finfo(float).eps))
+        expression_ratio = mean_coverage / (row["gene_expression"] + np.finfo(float).eps)
+        results = {
+            region : {'Coverage_cov':coverage_cov,
+                      'Zero_weight':zero_weight,
+                      'Relative_length':relative_region_length,     
+                      'Entropy_efficiency':entropy_efficiency,
+                      'Splice_five_border_ratio':ratio_splice_five_border,
+					  'Splice_three_border_ratio':ratio_splice_three_border,
+                      'Unspliced_five_site_ratio':ratio_unspliced_five_site,
+                      'Unspliced_three_site_ratio':ratio_unspliced_three_site,
+                      'Splice_five_all_ratio':ratio_splice_five_all,
+					  'Splice_three_all_ratio':ratio_splice_three_all,
+                      'All_three_vs_five_ratio':ratio_three_vs_five,
+                      'Expression_ratio': expression_ratio}
+            }
+        return results
+    except Exception as e:
+        logging.exception(e)
+        log.info(region)
+        return 0
+
+def getFeature(exon_feature_ls,
+               exon_info_file,
+               exon_feature_file,
+               parallel):
+    exon_data = \
+            pd.DataFrame.from_records([t.to_dict() for t in exon_feature_ls])
+    exon_data.set_index("region",inplace=True)
+    exon_data.to_csv(exon_info_file,sep="\t")
+    log.info("save " + exon_info_file)
+    rt_target_list = [{k:v} for k,v in exon_data.to_dict(orient="index").items()]
+    feat_dic = dict()
+    pool = Pool(parallel)
+    for exon_info in rt_target_list:
+        pool.apply_async(computeFeatures,
+                         (exon_info,),
+                         callback = feat_dic.update)
+    pool.close()
+    pool.join()
+    exon_feature = pd.DataFrame(feat_dic).T
+    exon_feature.dropna(axis=0,how="any",inplace=True)
+    exon_feature.to_csv(exon_feature_file,sep="\t",index_label="region")
+    log.info("save " + exon_feature_file)
+    return
+
+def mergeFeat(group_dic,
+              output):
+    feat_df_ls = []
+    feat_files = list(group_dic.keys())
+    for feat_file in feat_files:
+        rt_feat = pd.read_table(feat_file)
+        rt_feat["class"] = group_dic[feat_file]
+        feat_df_ls.append(rt_feat)
+    rt_merge = pd.concat(feat_df_ls)
+    rt_merge.to_csv(output,sep="\t",index=False)
+    log.info("Save " + output)
+    return
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Data prepare to build the model to identify terminal exon.')
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--terminal_exon_file',
+            type = str,
+            help='Annotation of terminal exon')
+    g.add_argument(
+            '--intermediate_exon_file',
+            type = str,
+            help='Annotation of intermediate exon')
+    g.add_argument(
+            '--bam_file',
+            type = str,
+            help='Bam file')
+    g.add_argument(
+            '--gene_interval_file',
+            type = str,
+            help='Gene interval file')
+    g.add_argument(
+            '--exon_len_file',
+            type = str,
+            help='json {gene:exon_len}')
+    g.add_argument(
+            '--save_dir',
+            type = str,
+            help='The directory that saved the results')
+    g = p.add_argument_group('Filter condition')
+    g.add_argument(
+        '--parallel',
+        help='Number of parallel',
+        type=int,
+        default=5)
+    g.add_argument(
+        '--check_last_base',
+        help='Count the last base',
+        type=int,
+        default=100)
+    g.add_argument(
+        '--splice_in_border_threshold',
+        help='Number of splice-in-boreder read',
+        type=int,
+        default=5)
+    g.add_argument(
+        '--min_overlap',
+        help='Reads that overlap with the target region',
+        type=int,
+        default=10)
+    g.add_argument(
+        '--count_unique',
+        type=bool,
+        default=True)
+    g.add_argument(
+        '--coverage_threshold',
+        help='Sequencing coverage of target region',
+        type=float,
+        default=0.95)
+    g.add_argument(
+        '--random_seed',
+        help='Sequencing coverage of target region',
+        type=int,
+        default=888)
+    return p
+
+# parage args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+log.info("#"*25 + "Start : Training data prepare" + "#"*25)
+log.info("Parameters:")
+log.info(args)
+log.info("-"*30)
+# input file
+terminal_not_overlap_start_intermediate = args.terminal_exon_file
+intermediate_not_overlap_start_terminal = args.intermediate_exon_file
+bam_file_path = args.bam_file
+gene_interval_bed_file = args.gene_interval_file
+exon_len_file = args.exon_len_file
+parallel_number = args.parallel
+random_seed = args.random_seed
+# threshold
+check_last_base = args.check_last_base
+splice_in_border_threshold = args.splice_in_border_threshold
+min_overlap = args.min_overlap
+count_unique = args.count_unique
+coverage_threshold = args.coverage_threshold
+# output
+save_dir = args.save_dir
+mkDir(save_dir)
+save_training_data = "1.training_data"
+save_training_data = os.path.join(save_dir,save_training_data)
+mkDir(save_training_data)
+terminal_info_file = "1.terminal.exons.info.txt"
+terminal_info_file = os.path.join(save_training_data,terminal_info_file)
+terminal_feat_file = "1.terminal.exons.feat.txt"
+terminal_feat_file = os.path.join(save_training_data,terminal_feat_file)
+intermediate_info_file = "2.intermediate.exons.info.txt"
+intermediate_info_file = os.path.join(save_training_data,intermediate_info_file)
+intermediate_feat_file = "2.intermediate.exons.feat.txt"
+intermediate_feat_file = os.path.join(save_training_data,intermediate_feat_file)
+background_info_file = "3.background.exon.info.txt"
+background_info_file = os.path.join(save_training_data,background_info_file)
+background_feat_file = "3.background.exon.feat.txt"
+background_feat_file = os.path.join(save_training_data,background_feat_file)
+merge_feat_file = "4.all.training.feat.txt"
+merge_feat_file = os.path.join(save_training_data,merge_feat_file)
+group_dic = {terminal_feat_file:"terminal",
+             intermediate_feat_file:"intermediate",
+             background_feat_file:"background"}
+
+# filter terminal exon
+terminal_exon_gene_dic = extractIvToDic(terminal_not_overlap_start_intermediate)
+annotated_terminal_exons,background_terminal_exons = filterTerminalResult(bam_file_path,
+                                                                          terminal_exon_gene_dic,
+                                                                          group = parallel_number,                     
+                                                                          region_type = "terminal",
+                                                                          check_last_base = check_last_base,
+                                                                          threshold_to_filter = splice_in_border_threshold,
+                                                                          min_overlap = min_overlap,
+                                                                          count_unique = count_unique,
+                                                                          coverage_threshold = coverage_threshold)
+terminal_exon_number = len(annotated_terminal_exons)
+log.info("Terminal exon number : %d" % terminal_exon_number)
+background_exon_number = len(background_terminal_exons)
+log.info("Background exon number : %d" % background_exon_number)
+terminal_exon_features = getFeatures(annotated_terminal_exons,
+                                     bam_file_path,
+                                     terminal_exon_gene_dic,
+                                     region_type = "terminal",
+                                     group = parallel_number,
+                                     count_unique = count_unique,
+                                     min_overlap = min_overlap)
+background_exon_features = getFeatures(background_terminal_exons,
+                                       bam_file_path,
+                                       terminal_exon_gene_dic,
+                                       region_type = "background",
+                                       group = parallel_number,
+                                       count_unique = count_unique,
+                                       min_overlap = min_overlap)
+
+# filter intermediate exon
+intermediate_exon_gene_dic = getIntermediateDic(intermediate_not_overlap_start_terminal,
+                                                terminal_exon_features,
+                                                background_exon_features,
+                                                terminal_same_gene = True,
+                                                limit_inter_number = True,
+                                                seed = random_seed)
+annotated_intermediate_exons = filterByExp(bam_file_path,
+                                           intermediate_exon_gene_dic,
+                                           filterIntermediateIv,
+                                           group = parallel_number,
+                                           region_type = "intermediate",
+                                           check_last_base = check_last_base,
+                                           threshold_to_filter = splice_in_border_threshold,
+                                           min_overlap = min_overlap,
+                                           count_unique = count_unique,
+                                           coverage_threshold = None)
+annotated_intermediate_exons = list(annotated_intermediate_exons.keys())
+intermediate_exon_number = len(annotated_intermediate_exons)
+log.info("Intermediate exon number : %d" % intermediate_exon_number)
+intermediate_exon_features = getFeatures(annotated_intermediate_exons,
+                                         bam_file_path,
+                                         intermediate_exon_gene_dic,
+                                         region_type = "intermediate",
+                                         group = parallel_number,
+                                         count_unique = count_unique,
+                                         min_overlap = min_overlap)
+# gene interval and read
+gene_iv_dic = geneIvDic(gene_interval_bed_file,
+                        terminal_exon_features,
+                        background_exon_features,
+                        intermediate_exon_features)
+union_exon_length_dic = readJson(exon_len_file)
+gene_read_dic = getGeneRead(gene_iv_dic,
+                            parallel_number,
+                            bam_file_path,
+                            union_exon_length_dic)
+# write 
+writeGeneRead(terminal_exon_features,gene_read_dic,union_exon_length_dic)
+writeGeneRead(background_exon_features,gene_read_dic,union_exon_length_dic)
+writeGeneRead(intermediate_exon_features,gene_read_dic,union_exon_length_dic)
+
+mkDir(save_training_data)
+if terminal_exon_features:
+    getFeature(terminal_exon_features,
+               terminal_info_file,
+               terminal_feat_file,
+               parallel_number)
+if background_exon_features:
+    getFeature(background_exon_features,
+               background_info_file,
+               background_feat_file,
+               parallel_number)
+if intermediate_exon_features:
+    getFeature(intermediate_exon_features,
+               intermediate_info_file,
+               intermediate_feat_file,
+               parallel_number)    
+
+# merge feat
+mergeFeat(group_dic,merge_feat_file)
+log.info("#"*25 + "Done : Training data prepare" + "#"*25 + "\n\n")
+

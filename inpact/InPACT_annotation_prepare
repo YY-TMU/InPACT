@@ -1,0 +1,352 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import json
+import HTSeq
+import shutil
+import logging
+import argparse
+import pybedtools
+import numpy as np
+import pandas as pd
+from itertools import chain
+os.environ["NUMEXPR_MAX_THREADS"] = "8"
+
+# set log
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+
+def createDir(dir_file):
+    if not os.path.exists(dir_file):
+        os.mkdir(dir_file)
+    return
+
+def exonFromGtf(gtf_file_path):
+    log.info("Reading %s" % (gtf_file_path))
+    # read gtf
+    gtf_file=HTSeq.GFF_Reader(gtf_file_path)
+    # exon list
+    exon_list = []
+    for gtf_line in gtf_file:
+        if gtf_line.type == "exon":   
+            chrom = gtf_line.iv.chrom
+            if not re.search("[M|_]",chrom):
+                transcript_id = gtf_line.attr['transcript_id']
+                if re.match("NM_|XM_",transcript_id): 
+                    if not chrom.startswith("chr"):
+                        chrom = "chr" + chrom
+                    start = gtf_line.iv.start
+                    end = gtf_line.iv.end
+                    gene_id = gtf_line.attr['gene_id']
+                    gene_id = ":".join([chrom,gene_id]) 
+                    strand = gtf_line.iv.strand
+                    exon_list.append([chrom,start,end,gene_id,transcript_id,strand])        
+    # exon df
+    columns = ["chrom","start","end","gene_id","transcript_id","strand"]
+    exon_df = pd.DataFrame.from_records(exon_list)
+    exon_df.columns = columns
+    # delete transcipts with only one exon
+    df_grouped = exon_df.groupby("transcript_id").count()["gene_id"]
+    df_selected_list = list(df_grouped[df_grouped > 1].index)
+    exon_df = exon_df.loc[exon_df["transcript_id"].isin(df_selected_list),]
+    exon_df.reset_index(inplace = True,drop=True)
+    return exon_df
+
+def saveBed(exon_df,indexes,filename):
+    if indexes:
+        target_exon_df = exon_df.iloc[indexes,]
+        target_exon_df = target_exon_df.sort_values(by = ["transcript_id"])
+        target_exon_df = target_exon_df.drop_duplicates(subset=["chrom", "start", "end", "strand"],keep="first")  
+        target_exon_df = target_exon_df.sort_values(by = ["chrom","start"])
+        target_exon_df.to_csv(filename,sep="\t",header=False,index=False)
+        return
+    else:
+        raise Exception("Blank index!")
+
+def writeExons(exon_df,terminal_bed_file,intermediate_bed_file,start_bed_file):
+    # save_index
+    transcript_terminal_exon_indexes = []
+    transcript_intermediate_exon_indexes = []
+    transcript_start_exon_indexes = []
+    exon_df_row_numbers = exon_df.shape[0] 
+    for x in exon_df.groupby(["chrom","transcript_id","strand"]):
+        chrom,transcript_id,strand = x[0]
+        transcript_exon_df = x[1]
+        transcript_exon_df.sort_values(["start"],inplace=True)
+        # check the order
+        exon_coordinate = list(zip(transcript_exon_df["start"],transcript_exon_df["end"]))
+        exon_coordinate =[b for a in exon_coordinate for b in a]
+        if not all(np.diff(exon_coordinate) >= 0):
+            raise Exception("Wrong sort!")
+        # extract index 
+        transcript_exon_indexs = list(transcript_exon_df.index)
+        if strand == "+":
+            transcript_terminal_exon_index = transcript_exon_indexs[-1:]
+            transcript_intermediate_exon_index = transcript_exon_indexs[1:-1]
+            transcript_start_exon_index = transcript_exon_indexs[0:1]
+        elif strand == "-":
+            transcript_terminal_exon_index = transcript_exon_indexs[0:1]
+            transcript_intermediate_exon_index = transcript_exon_indexs[1:-1]
+            transcript_start_exon_index = transcript_exon_indexs[-1:]
+        transcript_terminal_exon_indexes.extend(transcript_terminal_exon_index)
+        transcript_intermediate_exon_indexes.extend(transcript_intermediate_exon_index)
+        transcript_start_exon_indexes.extend(transcript_start_exon_index)
+    # write to bed
+    saveBed(exon_df,transcript_terminal_exon_indexes,terminal_bed_file)
+    saveBed(exon_df,transcript_intermediate_exon_indexes,intermediate_bed_file)
+    saveBed(exon_df,transcript_start_exon_indexes,start_bed_file)
+    return
+
+
+def write_non_overlapping_regions_to_bed(bed_in,bed_out):
+    # custom header
+    columns_custom_bed = ["chrom","start","end","gene_id","transcript_id","strand","count",]
+    # normal header
+    columns = ["chrom","start","end","gene_id","transcript_id","strand"]
+    rt_terminal = pybedtools.BedTool(bed_in).merge(s=False,
+                                                   c=[4,5,6,6],
+                                                   o="distinct,distinct,distinct,count")
+    rt_terminal = rt_terminal.sort().to_dataframe()
+    rt_terminal.columns = columns_custom_bed
+    # filter
+    selected_df = rt_terminal[rt_terminal["count"] == 1]
+    # add score columns and get only the required columns
+    selected_df = selected_df[columns]
+    selected_df[["start", "end"]] = \
+        selected_df[["start", "end"]].apply(pd.to_numeric)
+    selected_df.sort_values(["chrom", "start"],inplace=True)
+    selected_df.to_csv(bed_out,sep="\t",header=False,index=False)
+    return
+
+def write_non_overlapping_regions(selected_bed,
+                                  compare_bed_1,
+                                  compare_bed_2,
+                                  strand,
+                                  bed_out):
+    selected_bed = pybedtools.BedTool(selected_bed)
+    compare_bed_1 = pybedtools.BedTool(compare_bed_1)
+    compare_bed_2 = pybedtools.BedTool(compare_bed_2)
+    selected_bed.intersect(compare_bed_1,s=strand,v=True,wa=True
+    ).intersect(compare_bed_2,s=strand,v=True,wa=True
+    ).sort().saveas(bed_out)
+    return
+
+def extractNM(exon_file,
+              to_file):
+    rt_exon = pd.read_table(exon_file,header=None)
+    transcripts = rt_exon[4].to_list()
+    NM_index = []
+    for i,transcript in enumerate(transcripts):
+        if transcript.startswith("NM_"):
+            NM_index.append(i)
+    rt_transcript = rt_exon.loc[NM_index,]
+    rt_transcript.to_csv(to_file,sep="\t",header=False,index=False)
+    return
+
+def extractTeInterExon(gtf_file_path,save_dir,save_terminal,save_intermediate):
+    # variable
+    # temporary files
+    tmp_dir = os.path.join(save_dir,"tmp_dir")
+    createDir(tmp_dir)
+    terminal_bed_file = os.path.join(tmp_dir,"01.all_terminal_exons.bed")
+    intermediate_bed_file = os.path.join(tmp_dir,"02.all_intermediate_exons.bed")
+    start_bed_file = os.path.join(tmp_dir,"03.all_start_exons.bed")
+    terminal_not_overlap_other_terminal_file = os.path.join(tmp_dir,"04.terminal_exons_not_overlap_other_terminal_exons.bed")
+    intermediate_not_overlap_other_intermediate_file = os.path.join(tmp_dir,"05.intermediate_exons_not_overlap_other_intermediate_exons.bed")
+    terminal_not_overlap_start_intermediate = os.path.join(tmp_dir,"06.terminal_exons_non_overlapping_unstranded.bed")
+    intermediate_not_overlap_start_terminal = os.path.join(tmp_dir,"07.intermediate_exons_non_overlapping_unstranded.bed")
+    # exon dataframe
+    exon_df = exonFromGtf(gtf_file_path)
+    # extract exons
+    writeExons(exon_df,
+               terminal_bed_file,
+               intermediate_bed_file,
+               start_bed_file)
+    write_non_overlapping_regions_to_bed(terminal_bed_file,
+                                         terminal_not_overlap_other_terminal_file)
+    write_non_overlapping_regions_to_bed(intermediate_bed_file,
+                                         intermediate_not_overlap_other_intermediate_file)
+    write_non_overlapping_regions(selected_bed = terminal_not_overlap_other_terminal_file,
+                                  compare_bed_1 = intermediate_bed_file,
+                                  compare_bed_2 = start_bed_file,
+                                  strand = False,
+                                  bed_out = terminal_not_overlap_start_intermediate)
+    write_non_overlapping_regions(selected_bed = intermediate_not_overlap_other_intermediate_file,
+                                  compare_bed_1 = terminal_bed_file,
+                                  compare_bed_2 = start_bed_file,
+                                  strand = False,
+                                  bed_out = intermediate_not_overlap_start_terminal)
+    extractNM(terminal_not_overlap_start_intermediate,save_terminal)
+    log.info("Save %s" % save_terminal)
+    extractNM(intermediate_not_overlap_start_terminal,save_intermediate)
+    log.info("Save %s" % save_intermediate)   
+    shutil.rmtree(tmp_dir)
+    return
+
+def transcriptFromGtf(gtf_file_path):
+    # read gtf
+    gtf_file=HTSeq.GFF_Reader(gtf_file_path)
+    # exon list
+    transcript_list = []
+    for gtf_line in gtf_file:
+        if gtf_line.type == "transcript":
+            chrom = gtf_line.iv.chrom
+            if not re.search("[M|_]",chrom):
+                if not chrom.startswith("chr"):
+                    chrom = "chr" + chrom
+                start = gtf_line.iv.start
+                end = gtf_line.iv.end
+                gene_id = gtf_line.attr['gene_id']
+                gene_id = ":".join([chrom,gene_id])
+                transcript_id = gtf_line.attr['transcript_id']
+                strand = gtf_line.iv.strand
+                if re.match("NM_",transcript_id):
+                    transcript_list.append([chrom,start,end,gene_id,transcript_id,strand])        
+    # exon df
+    columns = ["chrom","start","end","gene_id","transcript_id","strand"]
+    transcript_df = pd.DataFrame.from_records(transcript_list)
+    transcript_df.columns = columns
+    return transcript_df
+
+def geneIv(transcript_df,
+           gene_iv_file):
+    gene_intervals = []
+    for x in transcript_df.groupby(["chrom","gene_id","strand"]):
+        chromosome,gene_id,strand = x[0]
+        gene_trans_df = x[1]
+        gene_coordinates = list(zip(gene_trans_df["start"],gene_trans_df["end"]))
+        gene_coordinates = [single for gene_coordinate in gene_coordinates for single in gene_coordinate]
+        gene_start = min(gene_coordinates)
+        gene_end = max(gene_coordinates)
+        gene_interval = [chromosome,int(gene_start),int(gene_end),gene_id,".",strand]
+        gene_intervals.append(gene_interval)
+    gene_interval_df = pd.DataFrame.from_records(gene_intervals)
+    gene_interval_df = gene_interval_df.sort_values(by = [0,1])
+    gene_interval_df.to_csv(gene_iv_file,sep="\t",index=False,header=False)
+    log.info("Save %s" % gene_iv_file)
+    return
+
+def writeJson(filename,
+              dt):
+    with open(filename,"w") as f:
+        f.write(json.dumps(dt, 
+                           indent=1,
+                           separators=(',',':')))
+    return
+
+def extraExon(gtf_file_path):
+    # read gtf
+    gtf_file = HTSeq.GFF_Reader(gtf_file_path)
+    # exon list
+    exon_list = []
+    for gtf_line in gtf_file:
+        if gtf_line.type == "exon":
+            chrom = gtf_line.iv.chrom
+            if not re.search("[M|_]",chrom):
+                transcript_id = gtf_line.attr['transcript_id']
+                if re.match("NM_",transcript_id):
+                    if not chrom.startswith("chr"):
+                        chrom = "chr" + chrom
+                    start = gtf_line.iv.start
+                    end = gtf_line.iv.end
+                    gene_id = gtf_line.attr['gene_id']
+                    gene_id = ":".join([chrom,gene_id]) 
+                    strand = gtf_line.iv.strand
+                    exon_list.append([chrom,start,end,gene_id,transcript_id,strand])
+    columns = ["chrom","start","end","gene_id","transcript_id","strand"]
+    exon_df = pd.DataFrame.from_records(exon_list)
+    exon_df.columns = columns  
+    return exon_df
+
+
+# merge exon
+def unionExon(all_exons):
+    union_exons = []
+    LEFT, RIGHT = 1, -1
+    all_exons_label = sorted(chain.from_iterable(((start, LEFT), (stop, RIGHT)) for start, stop in all_exons))
+    c = 0
+    for value, label in all_exons_label:
+        if c == 0:
+            x = value
+        c += label
+        if c == 0:
+            union_exons.append((x, value))
+    return union_exons
+
+def geneExons(exon_df,
+              gene_exon_json,
+              exon_length_json):
+    gene_exon_coordinate = dict()
+    all_union_exons = []
+    for x in exon_df.groupby(["chrom","gene_id","strand"]):
+        chromosome,gene_id,strand = x[0]
+        gene_exon_df = x[1]
+        exon_coordinate = list(zip(gene_exon_df["start"],gene_exon_df["end"]))
+        exon_coordinate = list(set(exon_coordinate))
+        gene_exon_coordinate[gene_id] = dict()
+        gene_exon_coordinate[gene_id]["chrom"] = chromosome
+        gene_exon_coordinate[gene_id]["strand"] = strand
+        gene_exon_coordinate[gene_id]["exons"] = exon_coordinate
+        # merge exon
+        gene_union_exons = unionExon(exon_coordinate)
+        for start,end in gene_union_exons:
+            all_union_exons.append([chromosome,start,end,gene_id,".",strand])
+    # save gene exon
+    writeJson(gene_exon_json,gene_exon_coordinate)
+    log.info("Save " + gene_exon_json)
+    # extract gene length
+    all_union_exon_df = pd.DataFrame(all_union_exons)
+    union_exon_length_dic = dict()
+    for x in all_union_exon_df.groupby(3):
+        gene_df = x[1]
+        union_exon_length_dic[x[0]] = sum(gene_df[2] - gene_df[1])
+    writeJson(exon_length_json,union_exon_length_dic)
+    log.info("Save " + exon_length_json)
+    return
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Data prepare for IPA prediction.')
+    p.add_argument(
+            '--annotation_file',
+            type = str,
+            help='Gene annotation(RefSeq)')
+    p.add_argument(
+            '--output',
+            type = str,
+            default = ".",
+            help=' output directory')
+    return p
+
+# parage args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+log.info("#"*25 + "Start : Date preparation" + "#"*25)
+# varialbe
+save_dir = args.output
+gtf_file_path = args.annotation_file
+# Run
+createDir(save_dir)
+log.info("Extracting annotated terminal and intermediate exons for training ...")
+terminal_exon_file = os.path.join(save_dir,"1.annotated.terminal.exons.training.bed")
+intermediate_exon_file = os.path.join(save_dir,"2.annotated.intermediate.exons.training.bed")
+extractTeInterExon(gtf_file_path,save_dir,terminal_exon_file,intermediate_exon_file)
+log.info("Extracting gene interval ...")
+gene_interval_bed = os.path.join(save_dir,"3.gene.interval.bed")
+geneIv(transcriptFromGtf(gtf_file_path),gene_interval_bed)
+log.info("Extracting exon coordinates of genes ...")
+gene_exon_file = os.path.join(save_dir,"4.gene.exon.coordinate.json")
+union_exon_len = os.path.join(save_dir,"5.gene.exon.length.json")
+exon_df = extraExon(gtf_file_path)
+geneExons(exon_df,gene_exon_file,union_exon_len)
+log.info("#"*25 + "Done : Date preparation" + "#"*25 + "\n\n")
+
+

@@ -1,0 +1,182 @@
+#!/usr/bin/env python
+
+import re
+import os
+import sys
+import logging
+import argparse
+import pybedtools
+import numpy as np
+import pandas as pd
+from multiprocessing import Pool
+os.environ["NUMEXPR_MAX_THREADS"]="4"
+
+# set log
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+# create new directory
+def createDir(dir_file):
+    if not os.path.exists(dir_file):
+        os.makedirs(dir_file,
+                    exist_ok=True)
+    return
+
+def getMappedRead(map_info):
+    with open(map_info,"r") as rt:
+        info = rt.read()
+    total_read = re.search("\n(\d+)\s.*?\d\smapped\s\(",info).groups()[0]
+    total_read = int(total_read)
+    return total_read
+
+# filter feature region according read count
+def filterFeatCount(featregion_count_file,
+                    filter_count_thresh,
+                    total_read):
+    rt_iv_count = pd.read_table(featregion_count_file,comment="#")
+    total_number = len(rt_iv_count)
+    log.info("Total number:%d" % total_number)
+    rt_iv_count["Normalized"] = rt_iv_count.iloc[:,6]/rt_iv_count.iloc[:,5] * 1000
+    rt_iv_count["Normalized"] = rt_iv_count["Normalized"]/total_read * 1000000
+    rt_iv_count_filter = rt_iv_count.loc[rt_iv_count["Normalized"] >= filter_count_thresh,]
+    filtered_number = len(rt_iv_count_filter)
+    log.info("Filtered number:%d" % filtered_number)
+    return rt_iv_count_filter
+
+def getPolyaLoc(row):
+    gene,chrom,iv_start,iv_end,strand = row[0:5]
+    if strand == "+":
+        pa_loc = iv_end
+    elif strand == "-":
+        pa_loc = iv_start
+    pa_start = pa_loc - 1
+    pa_end = pa_loc
+    pa_region = pd.Series([chrom,pa_start,pa_end,gene,".",strand])
+    pa_region = pd.Series(pa_region)
+    return pa_region
+
+def parallFunc(df):
+    return df.apply(getPolyaLoc,axis=1)
+
+def parallelGetRegions(rt_target,
+                       parallFunc,
+                       parallel_number):
+    log.info("Start : Get polyA sites")
+    rt_target_split = np.array_split(rt_target,parallel_number)
+    # parallel
+    pool = Pool(parallel_number)
+    rt_target_result = pd.concat(pool.map(parallFunc,rt_target_split))
+    pool.close()
+    pool.join()
+    log.info("Done : Get polyA sites")
+    return rt_target_result
+
+def getFilterdPolyA(rt_count,
+                    parallFunc,
+                    parallel_number,
+                    bed_out):
+    log.info("Start")
+    # extradt polyA
+    pa_df = parallelGetRegions(rt_count,parallFunc,parallel_number)
+    pa_df = pa_df.sort_values(by=[0,1])
+    pa_df.to_csv(bed_out,sep="\t",index=False,header=False)
+    log.info("Save " + bed_out)
+    return 
+
+def mergePa(predicted_polyA_file,
+            distance_thresh,
+            bed_out):
+    pa_site_bedtool = pybedtools.BedTool(predicted_polyA_file)
+    pa_site_bedtool.merge(s = True,
+                          d = distance_thresh,
+                          c = [4,3,6],
+                          o = "distinct").sort().saveas(bed_out)
+    return
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Filter feat region.')
+    # input and output
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--map_file',
+            type = str,
+            help = 'File includes map info.')
+    g.add_argument(
+            '--count_file',
+            type = str,
+            help = 'File of count.')        
+    g.add_argument(
+            '--filter_count_thresh',
+            help = 'Threshold of normalized count',
+            type = float,
+            default = 0.1)
+    g.add_argument(
+            '--parallel_number',
+            help = 'CPU number',
+            type = int,
+            default = 1)
+    g.add_argument(
+            '--distance_thresh',
+            help = 'Threshold of distance of polyA.',
+            type = int,
+            default = 10)
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--save_dir',
+            help='Output directory',
+            type=str)
+    g.add_argument(
+            '--feat_filter_bed_file',
+            help='Output file',
+            type=str)
+    g.add_argument(
+            '--feat_filter_merge_bed_file',
+            help='Output file',
+            type=str)
+    return p
+    
+
+# parse args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+map_file = args.map_file
+count_file = args.count_file
+filter_count_thresh = args.filter_count_thresh
+parallel_number = args.parallel_number
+distance_thresh = args.distance_thresh
+save_dir = args.save_dir
+feat_filter_bed_file = args.feat_filter_bed_file
+feat_filter_bed_file = os.path.join(save_dir,feat_filter_bed_file)
+feat_filter_merge_bed_file = args.feat_filter_merge_bed_file
+feat_filter_merge_bed_file = os.path.join(save_dir,feat_filter_merge_bed_file)
+# run
+log.info("#"*25 + "Start:Filter feat region" + "#"*25)
+log.info("Parameter:")
+log.info(args)
+log.info("-"*30)
+total_read = getMappedRead(map_file)
+log.info("Total mapped read : %d" % total_read)
+rt_iv_count_filter = filterFeatCount(count_file,
+                                     filter_count_thresh,
+                                     total_read)
+createDir(save_dir)
+getFilterdPolyA(rt_iv_count_filter,
+                parallFunc,
+                parallel_number,
+                feat_filter_bed_file)
+mergePa(feat_filter_bed_file,
+        distance_thresh,
+        feat_filter_merge_bed_file)
+log.info("#"*25 + "Done:Filter feat region" + "#"*25)
+
+
+
+
+
+

@@ -1,0 +1,1295 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import json
+import math
+import HTSeq
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+from functools import partial
+from multiprocessing import Pool
+from collections import Counter
+from collections import defaultdict
+os.environ["NUMEXPR_MAX_THREADS"] = "8"
+
+# set log
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+# variable
+number_per_group = 20000
+skip_feat_headers = ['region',
+                     'Coverage_cov',
+                     'Zero_weight',
+                     'Relative_length',
+                     'Entropy_efficiency',
+                     'Splice_five_border_ratio',
+                     'Splice_three_border_ratio',
+                     'Unspliced_five_site_ratio',
+                     'Unspliced_three_site_ratio',
+                     'Splice_five_all_ratio',
+                     'Splice_three_all_ratio',
+                     'All_three_vs_five_ratio',
+                     'Expression_ratio']
+composite_feat_headers = ["region",
+                          "Coverage_cov",
+                          "Zero_weight",
+                          "Relative_length",
+                          "Entropy_efficiency",
+                          "Splice_three_border_ratio",
+                          "Unspliced_three_site_ratio",
+                          "Splice_three_all_ratio",
+                          "Expression_ratio"]
+
+
+def mkDir(dir_file):
+    if not os.path.exists(dir_file):
+        os.makedirs(dir_file,
+                    exist_ok=True)
+    return
+
+def readJson(jsonfile):
+    with open(jsonfile,'r') as f:
+        json_dic = json.loads(f.read())
+    return json_dic
+
+
+class analysisPolya:
+    def __init__(self,
+                 polyA,
+                 feature_region,
+                 upstream_exons,
+                 closest_exons,
+                 chromosome,
+                 strand,
+                 gene_name):
+        self.polyA = polyA
+        self.feature_region = feature_region
+        self.upstream_exons = upstream_exons
+        self.closest_exons = closest_exons
+        self.chromosome = chromosome
+        self.strand = strand
+        self.gene_name = gene_name
+        self.ref_region_splice_in = []
+        self.spans_region_count = 0
+        self.possible_skipped_five_sites = defaultdict(partial(defaultdict,int))
+        self.possible_composite_five_sites = defaultdict(partial(defaultdict,int))
+
+
+def getPolyaUnit(df_row_obj,
+                 gene_exon_coordinate,
+                 erro_file = "erro.feat.txt"):
+    chromosome = df_row_obj._1
+    pa_start = df_row_obj._2
+    pa_end = df_row_obj._3
+    gene_names = df_row_obj._4
+    gene_names = gene_names.split(",")
+    pa_loc = df_row_obj._5
+    strand = df_row_obj._6 
+    polya_infos = []
+    for gene_name in gene_names:
+        # determine featrue region
+        distance = np.inf
+        exons = gene_exon_coordinate[gene_name]["exons"]
+        upstream_exons = []
+        feature_region = None
+        if strand == "+":
+            for start,end in exons:
+                diff = pa_start - end
+                if diff >= 0:
+                    upstream_exons.append((start,end))
+                    if diff < distance:
+                        select_end = end
+                        distance = diff
+            feature_region = [chromosome,select_end,pa_start+1,gene_name,".",strand]
+            closest_exons = [(st,en) for st,en in upstream_exons if en == select_end]            
+        elif strand == "-":
+            for start,end in exons:
+                diff = start - pa_end
+                if diff >= 0:
+                    upstream_exons.append((start,end))
+                    if diff < distance:
+                        select_start = start
+                        distance = diff
+            feature_region = [chromosome,pa_end-1,select_start,gene_name,".",strand]
+            closest_exons = [(st,en) for st,en in upstream_exons if st == select_start]        
+        if len(closest_exons) > 1:
+            exon_length_ls = list(map(lambda x:x[1]-x[0],closest_exons))
+            closest_exons = closest_exons[exon_length_ls.index(max(exon_length_ls))]  
+        elif len(closest_exons) == 1:
+            closest_exons = closest_exons[0]
+        if feature_region and upstream_exons and closest_exons:
+            polya_infos.append(analysisPolya(pa_loc,
+                                             feature_region,
+                                             upstream_exons,
+                                             closest_exons,
+                                             chromosome,
+                                             strand,
+                                             gene_name))            
+        else:
+            erro_info = [chromosome,pa_start,pa_end,gene_name,pa_loc,strand]
+            erro_info = "\t".join(list(map(str,erro_info))) + "\n"
+            writeCnt(erro_file,erro_info)
+            return 0
+    return polya_infos
+    
+def generatorPaUnit(filter_count_bed,
+                    gene_exon_coordinate,
+                    erro_file,
+                    number = 1000):
+    log.info("Read " + filter_count_bed)
+    rt_bed = pd.read_table(filter_count_bed,header=None)
+    total_number = len(rt_bed)
+    read_number = 0
+    # determin feature region
+    i = 0
+    polya_feat_ls = []
+    for site in rt_bed.itertuples():
+        pa_feat = getPolyaUnit(site,gene_exon_coordinate,erro_file)
+        if pa_feat:
+            polya_feat_ls.extend(pa_feat)
+            i += 1
+            read_number += 1
+            if (i == number) or (read_number == total_number):
+                log.info("Read polyA : %d/%d" % (read_number,total_number))
+                yield polya_feat_ls
+                i = 0
+                polya_feat_ls = []
+        else:
+            total_number -= 1   
+            
+def processInterval(polya_feat):
+    chromosome = polya_feat.chromosome
+    strand = polya_feat.strand
+    # feature region
+    feature_region_ls = polya_feat.feature_region
+    feature_start = feature_region_ls[1]
+    feature_end = feature_region_ls[2]
+    feature_region_interval = HTSeq.GenomicInterval(chromosome,
+                                                    feature_start,
+                                                    feature_end,
+                                                    strand)
+    # reference region
+    up_exon_start,up_exon_end = polya_feat.closest_exons
+    reference_region_interval = HTSeq.GenomicInterval(chromosome,
+                                                      up_exon_start,
+                                                      up_exon_end,
+                                                      strand)
+    # feature region and reference region
+    unit_start = min(up_exon_start,up_exon_end,feature_start,feature_end)
+    unit_end = max(up_exon_start,up_exon_end,feature_start,feature_end)
+    unit_interval = HTSeq.GenomicInterval(chromosome,
+                                          unit_start,
+                                          unit_end,
+                                          strand)
+    return feature_region_interval,reference_region_interval,unit_interval  
+
+class AlignmentInfo:
+    def __init__(self, align):
+        self.align = align
+        self.split_events = list()
+        self.regions = set()
+        self.cross_border = False
+        
+class AlignmentSplit:
+    def __init__(self, chromosome, strand, five_site):
+        self.chromosome = chromosome
+        self.strand = strand
+        self.five_site = five_site
+        self.three_site = None
+        
+def assessInterval(genomic_interval,alignment_info,min_overlap,genomic_array_set):
+    regions = set()
+    for interval,intersection in genomic_array_set[genomic_interval].steps():
+        if len(intersection) == 1:
+            if interval.length >= min_overlap:
+                matched_region = next(iter(intersection))
+                alignment_info.regions.add(matched_region)
+                regions.add(matched_region)
+        elif len(intersection) > 1:
+            raise Exception("ERROR: ref_region and feat_region seem to overlap!")
+    if len(regions) > 1:
+        alignment_info.cross_border = True      
+        
+def countAlignmentFilter(alignment_info,
+                         feat_region,
+                         polya_feat):
+    chromosome = polya_feat.chromosome
+    strand = polya_feat.strand
+    upstream_exons = polya_feat.upstream_exons
+    ref_region_exon = polya_feat.closest_exons
+    ref_region_start = ref_region_exon[0]
+    ref_region_end = ref_region_exon[1]
+    # prior exon
+    if strand == "+":
+        prior_exons = [(st,en) for st,en in upstream_exons if en == ref_region_end]
+    elif strand == "-":
+        prior_exons = [(st,en) for st,en in upstream_exons if st == ref_region_start]
+    assert len(prior_exons) > 0
+    # count
+    for region in alignment_info.regions:
+        if region == "feat_region":
+            if (alignment_info.cross_border and
+                len(alignment_info.split_events) == 0):
+                polya_feat.spans_region_count += 1              
+            elif (not alignment_info.cross_border and
+                  len(alignment_info.split_events) > 0
+            ):
+                for split_event in alignment_info.split_events:
+                    if alignment_info.align.iv.strand == "+":
+                        observed_five_site = []
+                        for exon_coordinate in upstream_exons:
+                            exon_start,exon_end = exon_coordinate
+                            current_five_site = ":".join(
+                                [chromosome,
+                                 str(exon_end),
+                                 strand]
+                            )
+                            if current_five_site in observed_five_site:
+                                continue
+                            else:
+                                observed_five_site.append(current_five_site)
+                            if (
+                                int(exon_end) == int(split_event.five_site)
+                            ):
+                                if (
+                                    feat_region.start <=
+                                    split_event.three_site and
+                                    split_event.three_site <=
+                                    feat_region.end
+                                ):
+                                    if (
+                                        alignment_info.align.iv.end <=
+                                        feat_region.end
+                                    ):
+                                        three_site_id = ":".join(
+                                            [split_event.chromosome,
+                                             str(split_event.three_site),
+                                             split_event.strand]
+                                        )
+                                        polya_feat.possible_skipped_five_sites[
+                                            three_site_id][
+                                                current_five_site] += 1
+
+
+                    elif alignment_info.align.iv.strand == "-":
+                        observed_five_site = []
+                        for exon_coordinate in upstream_exons:
+                            exon_start,exon_end = exon_coordinate
+                            current_five_site = ":".join(
+                                [chromosome,
+                                 str(exon_start),
+                                 strand]
+                            )
+                            if current_five_site in observed_five_site:
+                                continue
+                            else:
+                                observed_five_site.append(current_five_site)
+                            if (
+                                exon_start == int(split_event.five_site)
+                            ):
+                                if (
+                                    feat_region.start <=
+                                    split_event.three_site and
+                                    split_event.three_site <=
+                                    feat_region.end
+                                ):
+                                    if (
+                                        alignment_info.align.iv.start >=
+                                        feat_region.start
+                                    ):
+                                        three_site_id = ":".join(
+                                            [split_event.chromosome,
+                                             str(split_event.three_site),
+                                             split_event.strand])
+
+                                        polya_feat.possible_skipped_five_sites[
+                                            three_site_id][
+                                                current_five_site] += 1
+
+        elif region == "ref_region":            
+            if len(alignment_info.split_events) > 0:
+                for split_event in alignment_info.split_events:
+                    for prior_exon in prior_exons:
+                        if strand == "+":
+                            if int(split_event.three_site) == int(prior_exon[0]):
+                                polya_feat.ref_region_splice_in.append(split_event) 
+                                break
+                        elif strand == "-":
+                            if int(split_event.three_site) == int(prior_exon[1]):
+                                polya_feat.ref_region_splice_in.append(split_event) 
+                                break                       
+
+    
+
+def writeDic(filename,cnt):
+    with open(filename,"a") as possible:
+        possible.write(json.dumps(cnt) + "\n")
+    return                            
+                            
+def crypticSkippedSites(polya_feat,
+                        minimum_spliced_reads_for_skipped_start_site,
+                        to_file):
+    strand = polya_feat.strand
+    # extract
+    possible_exonic_start_sites = polya_feat.possible_skipped_five_sites
+    find_skip = False
+    confident_novel_skipped_exons = defaultdict(dict)
+    if possible_exonic_start_sites:
+        find_skip = True
+        for possible_exonic_start_site in possible_exonic_start_sites:
+            for possible_five_site in possible_exonic_start_sites[possible_exonic_start_site]:
+                count = int(possible_exonic_start_sites[possible_exonic_start_site][possible_five_site])
+                if count >= minimum_spliced_reads_for_skipped_start_site:
+                    novel_start_site_info = \
+                                possible_exonic_start_site.split(":")
+                    if novel_start_site_info[2] == "+":
+                        novel_exon = ":".join(
+                            [novel_start_site_info[0],
+                              str(novel_start_site_info[1]),
+                             str(polya_feat.feature_region[2]),
+                             "+",
+                             polya_feat.gene_name.split(":")[1]])
+                    elif novel_start_site_info[2] == "-":
+                        novel_exon = ":".join(
+                            [novel_start_site_info[0],
+                             str(polya_feat.feature_region[1]),
+                             str(novel_start_site_info[1]),                     
+                             "-",
+                             polya_feat.gene_name.split(":")[1]])
+                    feat_region = ":".join(
+                            [polya_feat.feature_region[0],
+                             str(polya_feat.feature_region[1]),
+                             str(polya_feat.feature_region[2]),                     
+                             strand])
+                    confident_novel_skipped_exons[novel_exon]["gene_name"] = polya_feat.gene_name
+                    confident_novel_skipped_exons[novel_exon]["feat_region"] = feat_region
+                    confident_novel_skipped_exons[novel_exon].setdefault("up_exon_three",[]).append([possible_five_site,count])
+                    confident_novel_skipped_exons[novel_exon]["polyA_site"] = polya_feat.polyA
+    if confident_novel_skipped_exons:
+        writeDic(to_file,confident_novel_skipped_exons)
+    return find_skip
+
+# determine composite or not
+def determineCompositeStart(polya_feat,
+                            minimum_spans_region_count):
+    if polya_feat.spans_region_count >= minimum_spans_region_count:
+        # norm region
+        ref_region_exon = polya_feat.closest_exons
+        ref_region_start = ref_region_exon[0]
+        ref_region_end = ref_region_exon[1]
+        strand = polya_feat.strand
+        chromosome = polya_feat.chromosome
+        # up exon
+        up_exons = polya_feat.upstream_exons
+        if strand == "+":
+            up_three = [x[1] for x in up_exons] 
+        elif strand == "-":
+            up_three = [x[0] for x in up_exons]          
+        # norm region splice in
+        ref_region_splice_in_events = polya_feat.ref_region_splice_in
+        if ref_region_splice_in_events:
+            for ref_region_splice_in_event in ref_region_splice_in_events:
+                composite_possible_five_ss = ref_region_splice_in_event.three_site
+                composite_possible_up_three = ref_region_splice_in_event.five_site
+                if composite_possible_up_three in up_three:
+                    composite_possible_five_ss = ":".join([chromosome,str(composite_possible_five_ss),strand])                    
+                    composite_possible_up_three = ":".join([chromosome,str(composite_possible_up_three),strand])
+                    polya_feat.possible_composite_five_sites[
+                        composite_possible_five_ss][
+                        composite_possible_up_three] += 1
+    return                            
+                            
+
+def crypticCompositeSite(polya_feat,
+                         to_file,
+                         minimun_ref_region_splice_in_count = 5):
+    possible_composite_five_sites = polya_feat.possible_composite_five_sites
+    confident_novel_composite_exons = defaultdict(dict)
+    if possible_composite_five_sites:
+        possible_exonic_start_sites_ls = list(possible_composite_five_sites.keys())
+        possible_exonic_start_sites_ls = sorted(possible_exonic_start_sites_ls,
+                                                key = lambda x:int(x.split(":")[1]))
+        strand = polya_feat.strand
+        if strand == "+":
+            possible_composite_five_site = possible_exonic_start_sites_ls[-1]
+        elif strand == "-":
+            possible_composite_five_site = possible_exonic_start_sites_ls[0]        
+        for possible_up_three in possible_composite_five_sites[possible_composite_five_site]:        
+            ref_region_splice_in_count = possible_composite_five_sites[possible_composite_five_site][possible_up_three]
+            if ref_region_splice_in_count >= minimun_ref_region_splice_in_count:
+                chromosome = polya_feat.chromosome
+                if strand == "+":
+                    novel_composite = ":".join(
+                        [chromosome,
+                         str(possible_composite_five_site.split(":")[1]),
+                         str(polya_feat.feature_region[2]),
+                         "+",
+                         polya_feat.gene_name.split(":")[1]])
+                elif strand == "-":
+                    novel_composite= ":".join(
+                        [chromosome,
+                         str(polya_feat.feature_region[1]),
+                         str(possible_composite_five_site.split(":")[1]),                         
+                         "-",
+                         polya_feat.gene_name.split(":")[1]])
+                feat_region = ":".join(
+                            [polya_feat.feature_region[0],
+                             str(polya_feat.feature_region[1]),
+                             str(polya_feat.feature_region[2]),                     
+                             strand])
+                confident_novel_composite_exons[novel_composite]["gene_name"] = polya_feat.gene_name
+                confident_novel_composite_exons[novel_composite]["feat_region"] = feat_region
+                confident_novel_composite_exons[novel_composite].setdefault("up_exon_three",[]).append([possible_up_three,
+                                                                                                        ref_region_splice_in_count]) 
+                confident_novel_composite_exons[novel_composite]["polyA_site"] = polya_feat.polyA
+    if confident_novel_composite_exons:
+        writeDic(to_file,confident_novel_composite_exons)
+    return      
+                
+def analysePaFeat(polya_feat,
+                  bam,
+                  skip_dic_file,
+                  composite_dic_file,
+                  min_overlap = 10,
+                  minimum_spans_region_count = 10,
+                  minimun_ref_region_splice_in_count = 5,
+                  minimum_spliced_reads_for_skipped_start_site = 5,
+                  count_unique = True):
+    # for single polya feat
+    chromosome = polya_feat.chromosome
+    strand = polya_feat.strand
+    feature_region_iv,ref_region_iv,unit_iv = processInterval(polya_feat)
+    genomic_array_set = HTSeq.GenomicArrayOfSets("auto",stranded=True)
+    genomic_array_set[ref_region_iv] += "ref_region"
+    genomic_array_set[feature_region_iv] += "feat_region"
+    unit_start = unit_iv.start
+    unit_end = unit_iv.end
+    region_location = chromosome + ":" + str(unit_start) + "-" + str(unit_end)
+
+    for align in bam.fetch(region = region_location):
+        if align.aligned:
+            if count_unique and not align.optional_field("NH") == 1:
+                continue      
+
+            if align.iv.strand is not strand:
+                align.iv.strand = strand
+                for cigar in align.cigar:
+                    cigar.ref_iv.strand = strand
+
+            alignment_info = AlignmentInfo(align=align)
+            genomic_interval = None
+            alignment_split = None
+            if align.iv.strand == "+":
+                cigar_list = align.cigar
+            elif align.iv.strand == "-":
+                cigar_list = reversed(align.cigar)
+            for cigar in cigar_list:
+                if cigar.type == "M":
+                    if genomic_interval is None:
+                        genomic_interval = cigar.ref_iv
+                    else:
+                        genomic_interval.extend_to_include(cigar.ref_iv)
+                elif cigar.type == "N":
+                    if alignment_split is None:
+                        if align.iv.strand == "+":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.end)
+                        elif align.iv.strand == "-":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.start)
+                    else:
+                        if align.iv.strand == "+":
+                            alignment_split.three_site = \
+                                genomic_interval.start
+                        elif align.iv.strand == "-":
+                            alignment_split.three_site = \
+                                genomic_interval.end
+                        alignment_info.split_events.append(alignment_split)
+                        alignment_split = None
+                        if align.iv.strand == "+":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.end)
+                        elif align.iv.strand == "-":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.start)
+                    assessInterval(genomic_interval,
+                                   alignment_info,
+                                   min_overlap,
+                                   genomic_array_set)
+                    genomic_interval = None
+            if genomic_interval is not None:
+                if alignment_split is not None:
+                    if align.iv.strand == "+":
+                        alignment_split.three_site = \
+                            genomic_interval.start
+                    elif align.iv.strand == "-":
+                        alignment_split.three_site = \
+                            genomic_interval.end
+                    alignment_info.split_events.append(alignment_split)
+                    alignment_split = None
+                assessInterval(genomic_interval,
+                               alignment_info,
+                               min_overlap,
+                               genomic_array_set)
+                genomic_interval = None
+            else:
+                raise Exception("ERROR: Weird case, check it!")
+
+            countAlignmentFilter(alignment_info,
+                                 feature_region_iv,
+                                 polya_feat)
+    # skipped
+    find_skip = crypticSkippedSites(polya_feat,
+                                    minimum_spliced_reads_for_skipped_start_site,
+                                    skip_dic_file)
+    # composite
+    if not find_skip:
+        determineCompositeStart(polya_feat,
+                                minimum_spans_region_count)
+        crypticCompositeSite(polya_feat,
+                             composite_dic_file,
+                             minimun_ref_region_splice_in_count)
+    return
+
+def dicFileToDic(dicfile):
+    to_dict = {}
+    with open(dicfile,"r") as dc:
+        infos = dc.readlines()
+    for info in infos:
+        to_dict.update(json.loads(info.strip()))
+    return to_dict
+                    
+def countAlignmentRead(alignment_info,
+                       iv,
+                       unspliced_five_site,
+                       unspliced_three_site,
+                       splice_three_all,
+                       splice_three_border,
+                       splice_five_all,
+                       splice_five_border):
+    if len(alignment_info.split_events) == 0:
+        if alignment_info.align.iv.strand == '+':
+            if (
+                int(alignment_info.align.iv.start) <
+                int(iv.start) and
+                int(alignment_info.align.iv.end) >
+                int(iv.start)
+            ):
+                unspliced_five_site += 1
+            if (
+                int(alignment_info.align.iv.start) <
+                int(iv.end) and
+                int(alignment_info.align.iv.end) >
+                int(iv.end)
+            ):
+                unspliced_three_site += 1
+
+        elif alignment_info.align.iv.strand == '-':
+            if (
+                int(alignment_info.align.iv.start) <
+                int(iv.end) and
+                int(alignment_info.align.iv.end) >
+                int(iv.end)
+            ):
+
+                unspliced_five_site += 1
+
+            if (
+                int(alignment_info.align.iv.start) <
+                int(iv.start) and
+                int(alignment_info.align.iv.end) >
+                int(iv.start)
+            ):
+
+                unspliced_three_site += 1
+
+    elif len(alignment_info.split_events) > 0:
+        
+        for split_event in alignment_info.split_events:
+            
+            if alignment_info.align.iv.strand == "+":
+                if (
+                    int(split_event.five_site) >=
+                    int(iv.start) and
+                    int(split_event.five_site) <=
+                    int(iv.end) and
+                    int(split_event.three_site) >=
+                    int(iv.end) and
+                    int(split_event.three_site) >=
+                    int(iv.start)
+                ):
+                    splice_three_all += 1
+                if int(split_event.five_site) == int(iv.end):
+                    splice_three_border += 1
+                if (
+                    int(split_event.three_site) >=
+                    int(iv.start) and
+                    int(split_event.three_site) <=
+                    int(iv.end) and
+                    int(split_event.five_site) <= 
+                    int(iv.start) and 
+                    int(split_event.five_site) <=
+                    int(iv.end)
+                ):
+                    splice_five_all += 1
+                if int(iv.start) == int(split_event.three_site):
+                    splice_five_border += 1
+
+            elif alignment_info.align.iv.strand == "-":
+                if (
+                    int(split_event.five_site) >=
+                    int(iv.start) and
+                    int(split_event.five_site) <=
+                    int(iv.end) and
+                    int(split_event.three_site) <=
+                    int(iv.start) and
+                    int(split_event.three_site) <=
+                    int(iv.end)
+                ):
+                    splice_three_all += 1
+
+                if int(split_event.five_site) == int(iv.start):
+                    splice_three_border += 1
+                if (
+                    int(split_event.three_site) >=
+                    int(iv.start) and
+                    int(split_event.three_site) <=
+                    int(iv.end) and 
+                    int(split_event.five_site) >=
+                    int(iv.start) and
+                    int(split_event.five_site) >=
+                    int(iv.end)
+                ):
+                    splice_five_all += 1
+
+                if int(split_event.three_site) == int(iv.end):
+                    splice_five_border += 1
+    return [unspliced_five_site,
+            unspliced_three_site,
+            splice_three_all,
+            splice_three_border,
+            splice_five_all,
+            splice_five_border]
+
+class CalculateRead(object):
+    def __init__(
+        self,
+        interval_info,
+        feat_region,
+        annotation,
+        gene_name,
+        splice_five_all,
+        splice_five_border,
+        splice_three_all,
+        splice_three_border,
+        unspliced_five_site,
+        unspliced_three_site,
+        profile,
+        five_site,
+        polyA
+    ):
+        self.interval_info = interval_info
+        self.feat_region = feat_region
+        self.annotation = annotation
+        self.gene_name = gene_name
+        self.splice_five_all = splice_five_all
+        self.splice_five_border = splice_five_border
+        self.splice_three_all = splice_three_all
+        self.splice_three_border = splice_three_border
+        self.unspliced_five_site = unspliced_five_site
+        self.unspliced_three_site = unspliced_three_site
+        self.profile = profile
+        self.five_site = five_site 
+        self.polyA = polyA
+        self.total_reads = None
+        self.exon_length = None
+        self.gene_expression = None
+
+    def to_dict(self):
+        return {
+            'region': self.interval_info,
+            'feat_region': self.feat_region,
+            'annotation': self.annotation,
+            'gene_name': self.gene_name,
+            'splice_five_all': self.splice_five_all,
+            'splice_five_border': self.splice_five_border,
+            'splice_three_all': self.splice_three_all,
+            'splice_three_border': self.splice_three_border,
+            'unspliced_five_site': self.unspliced_five_site,
+            'unspliced_three_site': self.unspliced_three_site,
+            'profile': self.profile,
+            'possible_five_site': self.five_site,
+            'polyA_site': self.polyA,
+            'total_reads': self.total_reads,
+            'exon_length': self.exon_length,
+            'gene_expression':self.gene_expression
+        }
+    
+def exonGetFeature(possible_region,
+                   confident_novel_exon,
+                   bam,
+                   region_feature = "novel_exon",
+                   min_overlap = 10,
+                   count_unique = True):
+    info_dic = confident_novel_exon[possible_region]
+    gene_name = info_dic["gene_name"]
+    polyA_site = info_dic["polyA_site"]
+    feat_region = info_dic["feat_region"]
+    possible_up_exon_three = []
+    for site_list in info_dic["up_exon_three"]:
+        possible_up_exon_three.append(":".join(list(map(str,site_list))))
+    possible_up_exon_three = ",".join(possible_up_exon_three)
+    chromosome,start,end,strand,gene = possible_region.split(":")
+    exon_interval = HTSeq.GenomicInterval(chromosome,
+                                          int(start),
+                                          int(end),
+                                          strand)
+    genomic_array_set = HTSeq.GenomicArrayOfSets("auto", stranded=True)
+    genomic_array_set[exon_interval] += region_feature   
+    region_location = chromosome + ":" + str(start) + "-" + str(end)
+    full_profile = HTSeq.GenomicArray("auto", stranded=True, typecode="i")
+    unspliced_five_site = 0
+    unspliced_three_site = 0 
+    splice_three_all = 0
+    splice_three_border = 0
+    splice_five_all = 0
+    splice_five_border = 0
+
+    for align in bam.fetch(region=region_location):  
+        if align.aligned:
+            if count_unique and (not align.optional_field("NH") == 1):
+                continue        
+            if exon_interval.strand is not align.iv.strand:
+                align.iv.strand = exon_interval.strand
+                for cigar in align.cigar:
+                    cigar.ref_iv.strand = exon_interval.strand   
+            alignment_info = AlignmentInfo(align=align)
+            genomic_interval = None
+            alignment_split = None    
+            if align.iv.strand == "+":
+                cigar_list = align.cigar
+            elif align.iv.strand == "-":
+                cigar_list = list(reversed(align.cigar))
+            else:
+                raise Exception("ERROR: unknown strand in alignment!")    
+            for cigar in cigar_list:
+                if cigar.type == "M":
+                    if genomic_interval is None:
+                        genomic_interval = cigar.ref_iv
+                    else:
+                        genomic_interval.extend_to_include(cigar.ref_iv)
+                    full_profile[cigar.ref_iv] += 1
+                elif cigar.type == "N":
+                    if alignment_split is None:
+                        if align.iv.strand == "+":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.end)
+                        elif align.iv.strand == "-":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.start)
+                    else:
+                        if align.iv.strand == "+":
+                            alignment_split.three_site = \
+                                genomic_interval.start
+                        elif align.iv.strand == "-":
+                            alignment_split.three_site = \
+                                genomic_interval.end
+                        alignment_info.split_events.append(alignment_split)
+                        alignment_split = None
+                        if align.iv.strand == "+":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.end)
+                        elif align.iv.strand == "-":
+                            alignment_split = AlignmentSplit(
+                                chromosome=genomic_interval.chrom,
+                                strand=genomic_interval.strand,
+                                five_site=genomic_interval.start)
+                    assessInterval(genomic_interval,
+                                   alignment_info,
+                                   min_overlap,
+                                   genomic_array_set)
+                    genomic_interval = None
+            if genomic_interval is not None:
+                if alignment_split is not None:
+                    if align.iv.strand == "+":
+                        alignment_split.three_site = \
+                            genomic_interval.start
+                    elif align.iv.strand == "-":
+                        alignment_split.three_site = \
+                            genomic_interval.end
+                    alignment_info.split_events.append(alignment_split)
+                    alignment_split = None
+                assessInterval(genomic_interval,
+                               alignment_info,
+                               min_overlap,
+                               genomic_array_set)
+                genomic_interval = None
+            else:
+                raise Exception("ERROR: Weird case, check it!")
+            if len(alignment_info.regions) == 1:
+                unspliced_five_site, \
+                unspliced_three_site, \
+                splice_three_all, \
+                splice_three_border, \
+                splice_five_all, \
+                splice_five_border = \
+                    countAlignmentRead(alignment_info=alignment_info,
+                                       iv = exon_interval,
+                                       unspliced_five_site = unspliced_five_site,
+                                       unspliced_three_site = unspliced_three_site, 
+                                       splice_three_all = splice_three_all,
+                                       splice_three_border = splice_three_border,
+                                       splice_five_all = splice_five_all,
+                                       splice_five_border = splice_five_border)
+
+    exon_profile = list(str(x) for x in list(full_profile[exon_interval]))
+    if strand == "-":
+        exon_profile = exon_profile[::-1]
+    profile = str(",".join(str(x) for x in exon_profile))
+    read_summary = CalculateRead(
+                interval_info = str(":".join([chromosome,str(int(start) + 1),str(end),strand,gene_name.split(":")[1]])),
+                feat_region = feat_region,
+                annotation = region_feature,
+                gene_name = gene_name,
+                splice_five_all = int(splice_five_all),
+                splice_five_border = int(splice_five_border),
+                splice_three_all = int(splice_three_all),
+                splice_three_border = int(splice_three_border),
+                unspliced_five_site = int(unspliced_five_site),
+                unspliced_three_site = int(unspliced_three_site),
+                profile = profile,
+                five_site = possible_up_exon_three,
+                polyA = polyA_site)
+    return read_summary  
+
+def getExonFeature(confident_novel_exons,bam,region_feature,process_number):
+    exon_feature_ls = []
+    if confident_novel_exons:
+        novel_exons = list(confident_novel_exons.keys())
+        novel_exon_number = len(novel_exons)
+        novel_exon_lss = []      
+        step = math.ceil(novel_exon_number/5)
+        for i in range(0, novel_exon_number, step):
+            novel_exon_lss.append(novel_exons[i:i+step])
+        i = 0
+        for novel_exon_ls in novel_exon_lss:
+            pool=Pool(process_number)
+            for novel_exon in novel_exon_ls:
+                pool.apply_async(exonGetFeature,
+                                 (novel_exon,confident_novel_exons,bam,region_feature),
+                                 callback=exon_feature_ls.append)
+                i += 1
+            pool.close()
+            pool.join()
+            log.info("Processing : %d/%d" % (i,novel_exon_number))
+    return exon_feature_ls       
+
+def geneIvDic(gene_interval_bed):
+    rt_gene_iv = pd.read_table(gene_interval_bed,header=None)
+    all_gene_iv_dic = dict()
+    for gene_info in rt_gene_iv.itertuples():
+        chromosome = gene_info._1
+        start = gene_info._2
+        end = gene_info._3
+        gene_name = gene_info._4
+        strand = gene_info._6
+        all_gene_iv_dic[gene_name] = [chromosome,start,end,strand]
+    return all_gene_iv_dic
+
+def slGeneIv(novel_exon_features,
+             composite_exon_features,
+             all_gene_iv_dic):
+    novel_exon_belong_genes = []
+    for novel_exon_feature in novel_exon_features:
+        novel_exon_belong_genes.append(novel_exon_feature.gene_name)
+    for composite_exon_feature in composite_exon_features:
+        novel_exon_belong_genes.append(composite_exon_feature.gene_name)                
+    novel_exon_belong_genes = list(set(novel_exon_belong_genes))    
+    gene_iv_dic = dict()
+    for gene_name in novel_exon_belong_genes:
+        gene_iv_dic[gene_name] = all_gene_iv_dic[gene_name]   
+    return gene_iv_dic
+
+def geneRead(gene_name,
+             gene_iv_dic,
+             bam,
+             union_exon_length_dic,
+             count_unique = True):
+    chromosome,start,end,strand = gene_iv_dic[gene_name]
+    region_location = chromosome + ":" + str(start) + "-" + str(end)
+    total_reads = 0
+    gene_read_dic = dict()
+    for align in bam.fetch(region=region_location):
+        if align.aligned:
+            if (
+                (count_unique) and not
+                (align.optional_field("NH") == 1)
+            ):
+                continue
+            if (
+                str(chromosome) == str(align.iv.chrom) and
+                int(start) <= int(align.iv.start) and
+                int(start) <= int(align.iv.end) and
+                int(end) >= int(align.iv.start) and
+                int(end) >= int(align.iv.end)
+            ):
+                total_reads += 1
+    read_per_base = round(total_reads/union_exon_length_dic[gene_name]*1000,3)
+    gene_read_dic[gene_name] = {"total_reads":total_reads,
+                                "read_per_base":read_per_base}
+    return gene_read_dic
+
+def getGeneRead(gene_iv_dic,
+                process_number,
+                bam,
+                union_exon_length_dic):
+    gene_read_dic = dict()
+    genes = list(gene_iv_dic.keys())
+    gene_number = len(genes)
+    gene_lss = []
+    step = math.ceil(gene_number/5)
+    for i in range(0, gene_number, step):
+        gene_lss.append(genes[i:i+step])
+    i = 0
+    for gene_ls in gene_lss:
+        # multi process
+        pool=Pool(process_number)
+        for gene_name in gene_ls:
+            pool.apply_async(geneRead,
+                             (gene_name,gene_iv_dic,bam,union_exon_length_dic),
+                             callback=gene_read_dic.update)
+            i += 1
+        pool.close()
+        pool.join()
+        log.info("Calculate the read of gene : %d/%d" % (i,gene_number))
+    return gene_read_dic    
+
+def writeCnt(fname,cnt):
+    with open(fname,"a") as handle:
+        handle.write(cnt)
+    return
+
+def computeFeatures(info_dic):
+    # novel exon info
+    region = list(info_dic.keys())[0]
+    row = info_dic[region]
+    try:
+        profile = [int(x) for x in row["profile"].split(",")]               
+        annotation = row['annotation']
+        if annotation == "Composite":
+            feat_region = row["feat_region"]
+            feat_region_st = int(feat_region.split(":")[1])
+            feat_region_end = int(feat_region.split(":")[2])
+            region_length = feat_region_end - feat_region_st
+            relative_region_length = region_length/row["exon_length"]
+            profile_feat = profile[-region_length:]
+            position_weight = sum([1/x for x in range(1,region_length+1)])
+            zero_position = []
+            for i,x in enumerate(profile_feat):
+                if x == 0:
+                    zero_position.append(i+1)
+            zero_weight = sum([1/x for x in zero_position])
+            zero_weight = zero_weight/position_weight                        
+            mean_profile = np.mean(profile_feat) + np.finfo(float).eps
+            coverage_cov = np.array(profile_feat).std()/mean_profile
+            probability_normalize = [x / sum(profile_feat) for x in profile_feat]
+            entropy_efficiency = -sum([p * np.log2(p + np.finfo(float).eps)
+                                       for p in probability_normalize]
+                                      ) / np.log2(region_length)
+            mean_profile_3p = \
+                (np.mean(profile_feat[max([-20, -len(profile_feat)]):]) +
+                 np.finfo(float).eps)
+            ratio_splice_three_border = row["splice_three_border"] / mean_profile_3p
+            ratio_unspliced_three_site = row["unspliced_three_site"] / mean_profile_3p
+            ratio_splice_three_all = row["splice_three_all"] / mean_profile_3p
+            gene_expression = row["gene_expression"] + np.finfo(float).eps
+            expression_ratio = mean_profile / gene_expression
+            results = [region,
+                       coverage_cov,
+                       zero_weight,
+                       relative_region_length,
+                       entropy_efficiency,
+                       ratio_splice_three_border,
+                       ratio_unspliced_three_site,
+                       ratio_splice_three_all,
+                       expression_ratio]            
+            return results                          
+        elif annotation == "Skipped":
+            region_length = len(profile)
+            mean_coverage = np.mean(profile)
+            coverage_cov = np.array(profile).std()/(mean_coverage + np.finfo(float).eps)
+            position_weight = sum([1/x for x in range(1,region_length+1)])
+            zero_position = []
+            for i,x in enumerate(profile):
+                if x == 0:
+                    zero_position.append(i+1)
+            zero_weight = sum([1/x for x in zero_position])
+            zero_weight = zero_weight/position_weight
+            probability_normalize = [x / sum(profile) for x in profile]
+            entropy_efficiency = -sum([p * np.log2(p + np.finfo(float).eps)
+                                       for p in probability_normalize]
+                                      ) / np.log2(region_length)
+            relative_region_length = region_length/row["exon_length"]
+            mean_profile_5p = \
+                (np.mean(profile[:min([20, len(profile)])]) +
+                 np.finfo(float).eps)
+            mean_profile_3p = \
+                (np.mean(profile[max([-20, -len(profile)]):]) +
+                 np.finfo(float).eps)
+            ratio_splice_five_border = row["splice_five_border"] / mean_profile_5p
+            ratio_splice_three_border = row["splice_three_border"] / mean_profile_3p
+            ratio_unspliced_five_site = row["unspliced_five_site"] / mean_profile_5p
+            ratio_unspliced_three_site = row["unspliced_three_site"] / mean_profile_3p
+            ratio_splice_five_all = row["splice_five_all"] / mean_profile_5p
+            ratio_splice_three_all = row["splice_three_all"] / mean_profile_3p
+            ratio_three_vs_five = ((row["splice_three_all"] + row["unspliced_three_site"]) /
+                                   (row["splice_five_all"] + row["unspliced_five_site"] + np.finfo(float).eps))
+            gene_expression = row["gene_expression"] + np.finfo(float).eps
+            expression_ratio = mean_coverage / gene_expression
+            results = [region,
+                       coverage_cov,
+                       zero_weight,
+                       relative_region_length,     
+                       entropy_efficiency,
+                       ratio_splice_five_border,
+                       ratio_splice_three_border,                      
+                       ratio_unspliced_five_site,
+                       ratio_unspliced_three_site,
+                       ratio_splice_five_all,
+                       ratio_splice_three_all,
+                       ratio_three_vs_five,
+                       expression_ratio]     
+            return results
+    except Exception as e:
+        logging.exception(e)
+        log.info(region)
+        sys.exit(1)
+        
+
+def getFeature(exon_feature_ls,
+               exon_info_file,
+               exon_feature_file,
+               feat_headers,
+               parallel):
+    exon_data = \
+            pd.DataFrame.from_records([t.to_dict() for t in exon_feature_ls])
+    exon_data.set_index("region",inplace=True)
+    exon_data.to_csv(exon_info_file,sep="\t")
+    log.info("save " + exon_info_file)
+    exon_data_list = [{k:v} for k,v in exon_data.to_dict(orient="index").items()]
+    exon_number = len(exon_data_list)
+    exon_list_group = int(np.ceil(exon_number / number_per_group))
+    log.info("Total number : %d" % exon_number)
+    exon_groups = [exon_data_list[(x*number_per_group):(x*number_per_group+number_per_group)] for x in range(exon_list_group)]
+    writeCnt(exon_feature_file,"\t".join(feat_headers) + "\n")
+    process_number = 0
+    for exon_info in exon_groups:  
+        results = []
+        pool = Pool(parallel)
+        for exon_dic in exon_info:
+            pool.apply_async(computeFeatures,
+                             (exon_dic,),
+                             callback = results.append)
+        pool.close()
+        pool.join()
+        results = [result for result in results if result != 0]
+        if len(results) > 0:
+            process_number += len(results)            
+            results = ["\t".join(map(str,x)) for x in results]
+            results = "\n".join(results) + "\n"
+            writeCnt(exon_feature_file,results)           
+            log.info("Processing : %d/%d" % (process_number,exon_number))
+    log.info("save " + exon_feature_file)
+    return
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Extract potential terminal exons.')
+    # input
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--bam_file',
+            type = str,
+            help='Bam file path')
+    g.add_argument(
+            '--polyA_file',
+            type = str,
+            help='Filtered polyA file path')
+    g.add_argument(
+            '--gene_exon_file',
+            type = str,
+            help='json {gene:exon}')
+    g.add_argument(
+            '--exon_len_file',
+            type = str,
+            help='json {gene:exon_len}')
+    g.add_argument(
+            '--gene_interval_bed_file',
+            type = str,
+            help='Bed file of gene interval.')
+    g.add_argument(
+            '--minimum_spliced_reads_for_skipped',
+            help='Reads that support skipped terminal exon',
+            type=int,
+            default=5)
+    g.add_argument(
+            '--minimum_span_reads_for_composite',
+            help='Reads that support composite terminal exon',
+            type=int,
+            default=10)
+    g.add_argument(
+            '--process_number',
+            type = int,
+            help = 'Parallel number.',
+            default = 1)
+    # output
+    g = p.add_argument_group('output')
+    g.add_argument(
+            '--save_dir',
+            type = str,
+            help='Save directory.')
+    return p
+ 
+
+# parse args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+bam_file_path = args.bam_file
+polyA_file_path = args.polyA_file
+gene_exon_file = args.gene_exon_file
+exon_len_file = args.exon_len_file
+gene_interval_bed_file = args.gene_interval_bed_file
+# min_overlap = args.min_overlap
+minimum_spliced_reads_for_skipped = args.minimum_spliced_reads_for_skipped
+minimum_span_reads_for_composite = args.minimum_span_reads_for_composite
+process_number = args.process_number
+save_dir = args.save_dir
+log.info("#"*25 + "Start:Extract novel exon" + "#"*25)
+log.info("Parameter:")
+log.info(args)
+log.info("-"*30)
+# output
+mkDir(save_dir)
+# tmp file
+tmp_dir = "tmp"
+tmp_dir = os.path.join(save_dir,tmp_dir)
+mkDir(tmp_dir)
+possible_skip_dic_file = "1.possible.skip.dic.txt"
+possible_skip_dic_file = os.path.join(tmp_dir,possible_skip_dic_file)
+possible_composite_dic_file = "2.possible.composite.dic.txt"
+possible_composite_dic_file = os.path.join(tmp_dir,possible_composite_dic_file)
+
+# result file
+error_info_file = "0.error.feat.txt"
+error_info_file = os.path.join(save_dir,error_info_file)
+skipped_exon_file = "1.skipped.novel.exon.txt"
+skipped_exon_file = os.path.join(save_dir,skipped_exon_file)
+skipped_exon_feature_file = "1.skipped.novel.exon.feature.txt"
+skipped_exon_feature_file = os.path.join(save_dir,skipped_exon_feature_file)
+composite_exon_file = "2.composite.novel.exon.txt"
+composite_exon_file = os.path.join(save_dir,composite_exon_file)
+composite_exon_feature_file = "2.composite.novel.exon.feature.txt"
+composite_exon_feature_file = os.path.join(save_dir,composite_exon_feature_file)
+
+# run
+# info of exon and gene length
+gene_exon_coordinate = readJson(gene_exon_file)
+union_exon_length_dic = readJson(exon_len_file)
+
+# generator of feat region
+polya_feat_lss = generatorPaUnit(polyA_file_path,
+                                 gene_exon_coordinate,
+                                 error_info_file,
+                                 number = 10000)
+
+# read bam
+bam = HTSeq.BAM_Reader(bam_file_path)
+
+# find novel exon
+for polya_feat_ls in polya_feat_lss:
+    pool=Pool(process_number)
+    for polya_feat in polya_feat_ls:
+        pool.apply_async(analysePaFeat,
+                         args = (polya_feat,bam,possible_skip_dic_file,possible_composite_dic_file),
+                         kwds = {"minimum_spliced_reads_for_skipped_start_site":minimum_spliced_reads_for_skipped,
+                                 "minimum_spans_region_count":minimum_span_reads_for_composite})
+    pool.close()
+    pool.join()
+
+
+confident_novel_skipped_exons = dicFileToDic(possible_skip_dic_file)
+confident_novel_composite_exons = dicFileToDic(possible_composite_dic_file)
+log.info("Number of skipped : %d" % (len(confident_novel_skipped_exons)))
+log.info("Number of composite : %d" % (len(confident_novel_composite_exons)))
+
+
+log.info("Extract read feature of skipped :")
+skipped_exon_feature_ls = getExonFeature(confident_novel_skipped_exons,bam,"Skipped",process_number)
+
+log.info("Extract read feature of composite :")
+composite_exon_feature_ls = getExonFeature(confident_novel_composite_exons,bam,"Composite",process_number)
+
+# select gene
+log.info("Extract info of gene expression")
+all_gene_iv_dic = geneIvDic(gene_interval_bed_file)
+gene_iv_dic = slGeneIv(skipped_exon_feature_ls,
+                       composite_exon_feature_ls,
+                       all_gene_iv_dic) 
+gene_read_dic = getGeneRead(gene_iv_dic,
+                            process_number,
+                            bam,
+                            union_exon_length_dic)
+
+# write gene read
+for skipped_exon_feature in skipped_exon_feature_ls:
+    gene_name = skipped_exon_feature.gene_name
+    skipped_exon_feature.total_reads = gene_read_dic[gene_name]["total_reads"]
+    skipped_exon_feature.exon_length = union_exon_length_dic[gene_name]
+    skipped_exon_feature.gene_expression = gene_read_dic[gene_name]["read_per_base"]
+for composite_exon_feature in composite_exon_feature_ls:
+    gene_name = composite_exon_feature.gene_name
+    composite_exon_feature.total_reads = gene_read_dic[gene_name]["total_reads"]
+    composite_exon_feature.exon_length = union_exon_length_dic[gene_name]
+    composite_exon_feature.gene_expression = gene_read_dic[gene_name]["read_per_base"]
+
+# skipped exon 
+if skipped_exon_feature_ls:
+    getFeature(skipped_exon_feature_ls,
+               skipped_exon_file,
+               skipped_exon_feature_file,
+               skip_feat_headers,
+               process_number)
+
+# composite
+if composite_exon_feature_ls:
+    getFeature(composite_exon_feature_ls,
+               composite_exon_file,
+               composite_exon_feature_file,
+               composite_feat_headers,
+               process_number)
+
+log.info("#"*25 + "Done:Extract novel exon" + "#"*25)
+

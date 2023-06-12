@@ -1,0 +1,114 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import HTSeq
+import logging
+import argparse
+import pandas as pd
+
+# set log
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+
+def createDir(dir_file):
+    if not os.path.exists(dir_file):
+        os.mkdir(dir_file)
+    return
+
+def transAnnotationInfo(annotation_file):
+    gtf_object=HTSeq.GFF_Reader(annotation_file)
+    gene_transcript_dic = dict()
+    novel_trans_te_dic = dict()
+    for gtf_line in gtf_object:
+        if gtf_line.type == "transcript":
+            chrom = gtf_line.iv.chrom
+            if not re.search("[M|_]",chrom):
+                gene_id = gtf_line.attr["gene_id"]
+                chrom_gene = ":".join([chrom,gene_id])
+                transcript_id = gtf_line.attr["transcript_id"]
+                gene_transcript_dic.setdefault(chrom_gene,set()).add(transcript_id)
+                if gtf_line.source == "InPACT":
+                    novel_trans_te_dic[transcript_id] = gtf_line.attr["InPACT_TE"]
+    return gene_transcript_dic,novel_trans_te_dic
+
+def calculate_usage(transcript_tpm_path,
+                    gene_transcript_dic,
+                    novel_trans_te_dic):
+    # TPM of transcript
+    transcript_tpm_df = pd.read_table(transcript_tpm_path)
+    transcript_tpm_dic = dict(zip(transcript_tpm_df["Name"],map(lambda x:round(x,4),transcript_tpm_df["TPM"])))
+    # TPM of gene
+    gene_tpm_dic = dict()
+    for gn,transcripts in gene_transcript_dic.items():
+        gene_tpm_dic[gn] = sum([transcript_tpm_dic[transcript] for transcript in transcripts])
+    IPA_usage = dict()
+    for novle_trans,novel_te in novel_trans_te_dic.items():
+        gene = ":".join([novel_te.split(":")[0],novel_te.split(":")[4]])
+        gene_tpm = gene_tpm_dic[gene]
+        if gene_tpm > 0:
+            IPA_usage[novel_te] = round(transcript_tpm_dic[novle_trans]/gene_tpm,3)
+        else:
+            IPA_usage[novel_te] = "NA"    
+    return IPA_usage
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Quantify IPA usage.')
+    p.add_argument(
+            '--transcript_tpm',
+            type = str,
+            help='Expression of transcripts (TPM).')    
+    p.add_argument(
+            '--annotation_file',
+            type = str,
+            help='Gene annotation including novel and annotated transcripts')
+    p.add_argument(
+            '--ipa_info',
+            type = str,
+            default = ".",
+            help='Predicted IPA events')
+    p.add_argument(
+            '--save_dir',
+            type = str,
+            default = ".",
+            help='Output directory')
+    p.add_argument(
+            '--save_file',
+            type = str,
+            default = "IPA_usage.txt",
+            help='Output file')
+    return p
+
+# parage args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+log.info("#"*25 + " Start : IPA Usage " + "#"*25)
+# varialbe
+novle_gtf_path = args.annotation_file
+transcript_tpm_path = args.transcript_tpm
+ipa_info_path = args.ipa_info
+save_dir = args.save_dir
+save_file = args.save_file
+# Run
+createDir(save_dir)
+gene_transcript_dic,novel_trans_te_dic = transAnnotationInfo(novle_gtf_path)
+ipa_usage_dic = calculate_usage(transcript_tpm_path,
+                                gene_transcript_dic,
+                                novel_trans_te_dic)
+ipa_info_df = pd.read_table(ipa_info_path)
+ipa_info_df["Usage"] = [ipa_usage_dic[x] for x in ipa_info_df["region"]]
+save_file = os.path.join(save_dir,save_file)
+ipa_info_df.to_csv(save_file,sep="\t",index=False,header=True)
+log.info("Save %s" % save_file)
+log.info("#"*25 + " Done : IPA Usage " + "#"*25)
+
+
+

@@ -1,0 +1,239 @@
+#!/bin/bash
+
+set -e
+ARGS=`getopt -a -o i:a:s:p:P:1:2:h  --long input_file:,annotation_file:,ipa_sites:,paired:,parallel:,minimum_spliced_reads_for_skipped:,minimum_span_reads_for_composite:,help -n "$0" -- "$@"`
+
+print_help() {
+  echo "Summary: Recognize IPA events from standard RNA-seq"
+  echo "Usage:   $0 -i <bam> -a <gtf> -s <polyA_sites>"
+  echo
+  echo "Options:"
+  printf "%-35s %-s\n"  "-i, -input_file"  "A BAM file that would be used to predict IPA sites and it should be sorted by coordinates."
+  printf "%-35s %-s\n"  "-a, -annotation_file"  "GTF file with annotated transcripts (RefSeq)."
+  printf "%-35s %-s\n"  "-s, -ipa_sites" "Regions from 20nt upstream to potential poly(A) sites, with columns for gene name, chromosome, start, end, and strand."
+  printf "%-35s %-s\n"  "-p, -paired"  "Whether or not the input bam file is paired. [default=True]"
+  printf "%-35s %-s\n"  "-minimum_spliced_reads_for_skipped"  "Minimum number of spliced reads required to consider the potential skipped terminal exon. [default=5]"
+  printf "%-35s %-s\n"  "-minimum_span_reads_for_composite"  "Minimum number of reads that cross the boundary required to consider the potential composite terminal exon. [default=10]"
+  printf "%-35s %-s\n"  "-P, -parallel"  "Number of the threads. [default=1]"
+  printf "%-35s %-s\n"  "-h, -help"  "Print this help menu."
+}
+
+if [ $? != 0 ]; then
+    echo "Terminating..."
+    print_help
+    exit 1
+fi
+echo ARGS=[$ARGS]
+eval set -- "${ARGS}"
+
+# set default
+parallel_number=1
+paired=True
+minimum_spliced_reads_for_skipped=5
+minimum_span_reads_for_composite=10
+
+
+while true
+do
+    case $1 in
+        -i|--input_file)
+          bam_file=$2
+          shift 2
+          ;;
+        -a|--annotation_file)
+          annotation_file=$2
+          shift 2
+          ;;       
+        -s|--ipa_sites)
+          last_base_saf_file=$2
+          shift 2
+          ;;      
+        -p|--paired)
+          [[ $2 == True ]] || [[ $2 == False ]] || { echo paired must be Ture or False! ; exit 1 ; }
+          paired=$2
+          shift 2
+          ;;
+        -P|--parallel)
+          parallel_number=$2
+          shift 2
+          ;;
+        -1|--minimum_spliced_reads_for_skipped)
+          minimum_spliced_reads_for_skipped=$2
+          shift 2
+          ;;
+        -2|--minimum_span_reads_for_composite)
+          minimum_span_reads_for_composite=$2
+          shift 2
+          ;;
+        -h|--help)
+          print_help
+          exit 1
+          ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            print_help
+            echo "Internal error!"
+            exit 1
+            ;;
+    esac
+done
+
+# check
+[ -f $bam_file ] || { echo "$bam_file not exists!"; exit 1; }
+[ -f $annotation_file ] || { echo "$annotation_file not exists!"; exit 1; }
+[ -f $last_base_saf_file ] || { echo "$last_base_saf_file not exists!"; exit 1; }
+
+terminalPredict(){
+    # parameter
+    gtf_file_path=$1
+    bam_file_path=$2
+    bam_id=$3    
+    
+    # data preparation
+    echo Prepare annotation files
+    annot_dir=${bam_id}/0.data_prepare
+    InPACT_annotation_prepare \
+        --annotation_file $gtf_file_path \
+        --output $annot_dir
+    
+    terminal_not_overlap_start_intermediate=${annot_dir}/1.annotated.terminal.exons.training.bed
+    intermediate_not_overlap_start_terminal=${annot_dir}/2.annotated.intermediate.exons.training.bed
+    gene_interval_bed_file=${annot_dir}/3.gene.interval.bed
+    gene_exon_file_path=${annot_dir}/4.gene.exon.coordinate.json
+    exon_len_file_path=${annot_dir}/5.gene.exon.length.json
+    # training data prepare
+    echo Training data prepare
+    InPACT_read_train_prepare \
+      --terminal_exon_file $terminal_not_overlap_start_intermediate \
+      --intermediate_exon_file $intermediate_not_overlap_start_terminal \
+      --bam_file $bam_file_path \
+      --gene_interval_file $gene_interval_bed_file \
+      --exon_len_file $exon_len_file_path \
+      --save_dir $bam_id \
+      --parallel $parallel_number
+
+
+    # build model
+    echo Build model
+    model_dir=read_model
+    skip_model_file=skip.terminal.exon.model.pkl
+    composite_model_file=composite.terminal.exon.model.pkl
+    InPACT_read_train_model \
+        --sample_dir $bam_id \
+        --save_dir $model_dir \
+        --save_skip_model $skip_model_file \
+        --save_composite_model $composite_model_file
+
+    # data filter
+    tmp_dir=tmp_$bam_id
+    tmp_dir=$bam_id/$tmp_dir
+    mkdir -p $tmp_dir
+
+    # First
+    echo Calculate count of last bases
+    last_base_output_file="1.polyA.last.regions.count.txt"
+    last_base_output_file=$tmp_dir/$last_base_output_file
+    if [[ $paired == True ]]
+    then
+        featureCounts -T $parallel_number -a $last_base_saf_file -F SAF -o $last_base_output_file -p -f -O --minOverlap 1 $bam_file_path
+    else
+        featureCounts -T $parallel_number -a $last_base_saf_file -F SAF -o $last_base_output_file -f -O --minOverlap 1 $bam_file_path
+    fi
+    # second
+    echo Filter last base
+    filter_last_base_file="2.last.base.filtered.polyA.bed"
+    filter_last_base_file=$tmp_dir/$filter_last_base_file
+    InPACT_last_base_filter \
+        --count_file $last_base_output_file \
+        --out_put $filter_last_base_file \
+        --num_core $parallel_number
+    # third
+    echo Build feat region
+    feat_region_output_file="3.polya.feat.region.saf"
+    feat_region_output_file=$tmp_dir/$feat_region_output_file
+    InPACT_feat_region \
+        --intron_polya_file $filter_last_base_file \
+        --gene_exon_file $gene_exon_file_path \
+        --out_put $feat_region_output_file
+    # fourth
+    echo Calculate count of feat region
+    feat_region_count="4.polya.feat.region.countread.txt"
+    feat_region_count=$tmp_dir/$feat_region_count
+    if [[ $paired == True ]]
+    then
+        featureCounts -T $parallel_number -a $feat_region_output_file -F SAF -o $feat_region_count -p -f -O --minOverlap 10 $bam_file_path
+    else
+        featureCounts -T $parallel_number -a $feat_region_output_file -F SAF -o $feat_region_count -f -O --minOverlap 10 $bam_file_path
+    fi
+    # fifth
+    echo Calculate depth
+    map_file="5.map.info.txt"
+    map_file=$tmp_dir/$map_file
+    samtools flagstat $bam_file_path -@ $parallel_number > $map_file
+    # sixth
+    echo Filter feat region
+    pa_filter_by_count_dir=2.filtered_polyA
+    pa_filter_by_count_dir=$bam_id/$pa_filter_by_count_dir
+    feat_filter_bed_file="1.feat.filter.polyA.bed"
+    feat_filter_merge_bed_file="2.feat.filter.polyA.merge.bed"
+    InPACT_feat_filter \
+        --map_file $map_file \
+        --count_file $feat_region_count \
+        --parallel_number $parallel_number \
+        --save_dir $pa_filter_by_count_dir \
+        --feat_filter_bed_file $feat_filter_bed_file \
+        --feat_filter_merge_bed_file $feat_filter_merge_bed_file
+
+    # extract possible exon
+    echo Extract potential terminal exon
+    extract_potential_terminal_exon_dir=3.potential_terminal_exon
+    polyA_file_path=$pa_filter_by_count_dir/$feat_filter_merge_bed_file
+    extract_potential_terminal_exon_dir=$bam_id/$extract_potential_terminal_exon_dir
+    InPACT_potential_TE \
+        --bam_file $bam_file_path \
+        --polyA_file $polyA_file_path \
+        --gene_exon_file $gene_exon_file_path \
+        --exon_len_file $exon_len_file_path \
+        --gene_interval_bed_file $gene_interval_bed_file \
+        --minimum_spliced_reads_for_skipped $minimum_spliced_reads_for_skipped \
+        --minimum_span_reads_for_composite $minimum_span_reads_for_composite \
+        --process_number $parallel_number \
+        --save_dir $extract_potential_terminal_exon_dir 
+
+    # terminal exon predict
+    possible_skipped_feat_file=$extract_potential_terminal_exon_dir/1.skipped.novel.exon.feature.txt
+    possible_skipped_info_file=$extract_potential_terminal_exon_dir/1.skipped.novel.exon.txt
+    possible_composite_feat_file=$extract_potential_terminal_exon_dir/2.composite.novel.exon.feature.txt
+    possible_composite_info_file=$extract_potential_terminal_exon_dir/2.composite.novel.exon.txt
+    predict_skip_model_path=$bam_id/$model_dir/$skip_model_file
+    predict_composite_model_path=$bam_id/$model_dir/$composite_model_file
+    save_dir=$bam_id
+    InPACT_predict \
+        --possible_skipped_feat_file $possible_skipped_feat_file \
+        --possible_skipped_info_file $possible_skipped_info_file \
+        --possible_composite_feat_file $possible_composite_feat_file \
+        --possible_composite_info_file $possible_composite_info_file \
+        --skip_model_file $predict_skip_model_path \
+        --composite_model_file $predict_composite_model_path \
+        --save_dir $save_dir
+    # remove intermediate file
+    rm -r $annot_dir
+    rm -r ${bam_id}/1.training_data
+    rm -r ${pa_filter_by_count_dir}
+    rm -r ${extract_potential_terminal_exon_dir}
+    rm -r $tmp_dir
+}
+
+# run
+bam_id=${bam_file##*/}
+bam_id=${bam_id%%.*}
+# mkdir $bam_id
+echo -e `date '+%Y.%m.%d %H:%M'` '\tStart\t' $bam_file
+terminalPredict $annotation_file $bam_file $bam_id
+echo -e `date '+%Y.%m.%d %H:%M'` '\tFinish\t' $bam_file
+
+
+

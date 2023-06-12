@@ -1,0 +1,166 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import joblib
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+# set log
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+def mkDir(dir_file):
+    if not os.path.exists(dir_file):
+        os.makedirs(dir_file,
+                    exist_ok=True)
+    return
+
+
+def loadModelPredict(feat_file,
+                     info_file,                     
+                     classifier_model):
+    log.info(classifier_model + " is predicting ...")
+    # read
+    rt_feat = pd.read_table(feat_file,
+                            index_col= "region")
+    rt_info = pd.read_table(info_file,
+                            index_col = "region")
+    # load model
+    predict_model = joblib.load(classifier_model)
+    # predict class
+    results = predict_model.predict(rt_feat)
+    # predict pro
+    class_proportion = predict_model.predict_proba(rt_feat)
+    class_proportion_df = pd.DataFrame(class_proportion)
+    class_proportion_df.columns = np.unique(["terminal","intermediate","background"])
+    class_proportion_df.index = rt_feat.index
+    class_proportion_df["Results"] = results
+    region_terminal_probablity = dict(zip(class_proportion_df.index.to_list(),
+                                          class_proportion_df["terminal"].to_list()))
+    # extract terminal
+    # class added to info file
+    region_class_dic = dict(zip(rt_feat.index,results))
+    rt_info["Predicted_class"] = rt_info.index.to_series().apply(lambda x:region_class_dic[x])
+    # save predicted terminal exon file
+    rt_te = rt_info.loc[rt_info["Predicted_class"] == "terminal",]
+    te_regions = rt_te.index.to_list()
+    te_regions = [te_region.split(":") for te_region in te_regions]
+    te_region_length = [int(te_region[2])-int(te_region[1])+1 for te_region in te_regions]
+    rt_te = rt_te.loc[:,["annotation","gene_name","possible_five_site","polyA_site","Predicted_class"]]
+    rt_te["region_length"] = te_region_length
+    rt_te = rt_te.loc[:,["annotation","gene_name","possible_five_site","region_length","polyA_site","Predicted_class"]]
+    rt_te["Terminal_probablity"] = rt_te.index.to_series().apply(lambda x:region_terminal_probablity[x])
+    return rt_te
+
+def delteMulti(rt_te):
+    regions = rt_te.index.to_list()
+    probablities = rt_te["Terminal_probablity"].to_list()
+    regions_split = [x.split(":") + [probablities[i]] for i,x in enumerate(regions)]
+    terminal_region_probality = pd.DataFrame(regions_split,
+                                             index=regions,
+                                             columns=["chromosome","start","end","strand","gene","probablity"])
+    final_results = []
+    for x in terminal_region_probality.groupby(["chromosome","start","strand"]):
+        te_df = x[1]
+        row_number = te_df.shape[0]
+        if row_number == 1:
+            final_results.append(te_df.index[0])
+        elif row_number > 1:
+            final_results.append(te_df["probablity"].idxmax())
+    terminal_region_probality = terminal_region_probality.loc[final_results,] 
+    # second
+    final_results = []
+    for x in terminal_region_probality.groupby(["chromosome","end","strand"]):
+        te_df = x[1]
+        row_number = te_df.shape[0]
+        if row_number == 1:
+            final_results.append(te_df.index[0])
+        elif row_number > 1:
+            final_results.append(te_df["probablity"].idxmax())
+    final_results = sorted(final_results,key=lambda x:(x.split(":")[0],
+                                                       x.split(":")[1]))
+    final_results_df = rt_te.loc[final_results,]
+    log.info("Number : %d" % final_results_df.shape[0])
+    return final_results_df
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Predict terminal exons.')
+    # input and output
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--possible_skipped_feat_file',
+            type = str,
+            help='Feat file of skip')
+    g.add_argument(
+            '--possible_skipped_info_file',
+            type = str,
+            help='Info file of skip')
+    g.add_argument(
+            '--possible_composite_feat_file',
+            type = str,
+            help='Feat file of composite')
+    g.add_argument(
+            '--possible_composite_info_file',
+            type = str,
+            help='Info file of composite')
+    g.add_argument(
+            '--skip_model_file',
+            type = str,
+            help='model_file')
+    g.add_argument(
+            '--composite_model_file',
+            type = str,
+            help='model_file')
+    g = p.add_argument_group('output')
+    g.add_argument(
+            '--save_dir',
+            type = str,
+            help='Save directory.')
+    return p
+
+# parse args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+possible_skipped_feat_file = args.possible_skipped_feat_file
+possible_skipped_info_file = args.possible_skipped_info_file
+possible_composite_feat_file = args.possible_composite_feat_file
+possible_composite_info_file = args.possible_composite_info_file
+skip_model_file = args.skip_model_file
+composite_model_file = args.composite_model_file
+save_dir = args.save_dir
+predicted_terminal_result = "1.predicted.terminal.results.txt"
+predicted_terminal_result = os.path.join(save_dir,predicted_terminal_result)
+log.info("#"*25 + "Start : Predict terminal exon" + "#"*25)
+log.info("Parameter:")
+log.info(args)
+log.info("-"*30)
+# run
+mkDir(save_dir)
+# skip
+rt_skip_te = loadModelPredict(possible_skipped_feat_file,
+                              possible_skipped_info_file,                     
+                              skip_model_file)
+rt_skip_results = delteMulti(rt_skip_te)
+# composite
+rt_composite_te = loadModelPredict(possible_composite_feat_file,
+                                   possible_composite_info_file,                     
+                                   composite_model_file)
+rt_composite_results = delteMulti(rt_composite_te)
+# merge
+rt_merge = pd.concat([rt_skip_results,rt_composite_results])
+rt_merge = rt_merge.loc[:,["annotation","gene_name","possible_five_site","polyA_site"]]
+rt_merge = rt_merge.rename(columns={"gene_name":"gene_id","possible_five_site":"possible_five_ss"})
+rt_merge.to_csv(predicted_terminal_result,sep="\t")
+log.info(Counter(rt_merge["annotation"]))
+log.info("Save " + predicted_terminal_result)
+log.info("#"*25 + "Done : Predict terminal exon" + "#"*25)

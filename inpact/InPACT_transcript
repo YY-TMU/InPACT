@@ -1,0 +1,1017 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import HTSeq
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+from pyfasta import Fasta
+os.environ['NUMEXPR_MAX_THREADS'] = '16'
+
+# set log
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+# function
+def splitTerminal(terminal_exon_path):
+    log.info("Reading " + terminal_exon_path)
+    rt_te = pd.read_table(terminal_exon_path)
+    novel_terminal_genes = list(set(rt_te["gene_id"]))
+    log.info("Gene number : %d" % len(novel_terminal_genes))
+    # split te
+    rt_te_skip = rt_te.loc[rt_te["annotation"] == "Skipped",]
+    log.info("Skip number : %d" % len(rt_te_skip))
+    rt_te_composite = rt_te.loc[rt_te["annotation"] == "Composite",]
+    log.info("Composite number : %d" % len(rt_te_composite))
+    return novel_terminal_genes,rt_te_skip,rt_te_composite
+
+def ivFromGtf(gtf_file_path,novel_terminal_genes):
+    log.info("Reading %s" % (gtf_file_path))
+    # read gtf
+    gtf_lines=HTSeq.GFF_Reader(gtf_file_path)
+    iv_list = []
+    for gtf_line in gtf_lines:
+        chrom = gtf_line.iv.chrom
+        if not re.search("[M|_]",chrom):
+            transcript_id = gtf_line.attr['transcript_id']
+            if re.match("NM_",transcript_id): 
+                if not chrom.startswith("chr"):
+                    chrom = "chr" + chrom
+                gene_id = gtf_line.attr['gene_id']
+                gene_id = ":".join([chrom,gene_id]) 
+                gene_name = gtf_line.attr['gene_name']
+                if gene_id in novel_terminal_genes:
+                    start = gtf_line.iv.start + 1
+                    end = gtf_line.iv.end
+                    strand = gtf_line.iv.strand
+                    iv_type = gtf_line.type
+                    frame = gtf_line.frame
+                    iv_list.append([chrom,start,end,gene_id,transcript_id,strand,iv_type,gene_name,frame])
+    # dataframe
+    columns = ["chrom","start","end","gene_id","transcript_id","strand","type","gene_name","frame"]
+    iv_df = pd.DataFrame.from_records(iv_list)
+    iv_df.columns = columns
+    return iv_df
+
+class novelTranscript:
+    # object of transcript
+    def __init__(self,
+                 gene_id,
+                 gene_name,
+                 transcript_id,
+                 exon,
+                 start_codon,
+                 stop_codon,
+                 five_UTR,
+                 strand,
+                 annotation,
+                 cds):
+        self.gene_id = gene_id
+        self.gene_name = gene_name
+        self.transcript_id = transcript_id
+        self.exon = exon
+        self.start_codon = start_codon
+        self.five_UTR = five_UTR
+        self.strand = strand
+        self.annotation = annotation
+        self.cds = cds
+        self.stop_codon = stop_codon
+        self.three_UTR = None
+                
+    def to_dict(self):
+        return {"gene_id":self.gene_id,
+                "gene_name":self.gene_name,
+                "strand":self.strand,
+                "transcript_id":self.transcript_id,
+                "exon":tuple(self.exon),
+                "five_UTR":tuple(self.five_UTR),
+                "three_UTR":self.three_UTR,
+                "start_codon":self.start_codon,
+                "stop_codon":self.stop_codon,
+                "CDS":self.cds,
+                "annotation":self.annotation}
+    
+def compositeTranscript(rt_te_composite):
+    log.info("Extract info of composite transcript...")
+    composite_transcript_dic = dict()
+    for x in rt_te_composite.itertuples():
+        region = x.region
+        chrom,te_start,te_end,strand,gn = region.split(":")
+        te_start,te_end = int(te_start),int(te_end)
+        gene_id = x.gene_id
+        possible_up_sites = x.possible_five_ss.split(",")      
+        possible_up_locs = np.array([int(x.split(":")[1]) for x in possible_up_sites])
+        if strand == "+":
+            possible_up_site = possible_up_sites[possible_up_locs.argmax()]
+        elif strand == "-":
+            possible_up_site = possible_up_sites[possible_up_locs.argmin()]
+        up_site = int(possible_up_site.split(":")[1])
+        exon_info = gtf_iv_df.loc[gtf_iv_df["gene_id"] == gene_id,]
+        gene_name = list(set(exon_info["gene_name"]))
+        assert len(gene_name) == 1
+        gene_name = gene_name[0]
+        if strand == "+":
+            # up
+            up_possible_transcripts = exon_info.loc[exon_info["end"] == up_site,]
+            up_possible_transcripts = up_possible_transcripts.loc[up_possible_transcripts["type"] == "exon",]
+            up_possible_transcripts_set = set(up_possible_transcripts["transcript_id"])
+            # tem
+            tem_possible_transcripts = exon_info.loc[(exon_info["start"] == te_start) & (exon_info["end"] < te_end),]
+            tem_possible_transcripts = tem_possible_transcripts.loc[tem_possible_transcripts["type"] == "exon",]
+            tem_possible_transcripts_set = set(tem_possible_transcripts["transcript_id"])
+            # same transcript
+            transcript_intersection = up_possible_transcripts_set.intersection(tem_possible_transcripts_set)
+            # select template transcript
+            transcript_intersection = up_possible_transcripts_set.intersection(tem_possible_transcripts_set)
+            if len(transcript_intersection) == 1:
+                filtered_transcript = list(transcript_intersection)[0]
+            else:
+                if len(transcript_intersection) > 1:
+                    filtered_transcripts = list(transcript_intersection)
+                else:
+                    filtered_transcripts = list(tem_possible_transcripts_set)
+                    up_site = te_start - 2
+                filtered_transcript_df = exon_info.loc[gtf_iv_df["transcript_id"].isin(filtered_transcripts),]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["type"]=="exon",]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["start"]<=te_start,]
+                filtered_transcript_df["len"] = filtered_transcript_df["end"] - filtered_transcript_df["start"] + 1
+                filtered_transcript_len_df = filtered_transcript_df.loc[:,["transcript_id","len"]].groupby(by=["transcript_id"]).sum()
+                filtered_transcript = filtered_transcript_len_df["len"].idxmax()
+            # exon of transcript
+            transcript_exon_info = exon_info.loc[(exon_info["type"] == "exon") & (exon_info["transcript_id"] == filtered_transcript)]
+            transcript_exon_info = transcript_exon_info.sort_values(by = ["chrom","start"])
+            exon_coordinate = list(zip(transcript_exon_info["start"],transcript_exon_info["end"]))
+            exon_coordinate = sorted(exon_coordinate,key = lambda x:x[0]) 
+            coordinate_iv = dict()
+            for ec in exon_coordinate:
+                coordinate_iv[ec[0]] = ec
+                coordinate_iv[ec[1]] = ec
+            template_exon = coordinate_iv.get(te_start,[np.inf,np.inf])                       
+            novel_transcript_info = transcript_exon_info.loc[transcript_exon_info["end"] <= up_site,]
+            novel_transcript_exon = list(zip(novel_transcript_info["start"],
+                                             novel_transcript_info["end"]))
+            novel_transcript_exon.append((te_start,te_end))
+            # info of transcript
+            transcript_info = exon_info.loc[(exon_info["transcript_id"] == filtered_transcript),]
+            # start codon
+            start_codon = transcript_info.loc[transcript_info["type"] == "start_codon"]
+            start_codon_frame = dict(zip(list(zip(start_codon["start"],start_codon["end"])),start_codon["frame"]))
+            start_codon = tuple(zip(start_codon["start"],start_codon["end"]))
+            start_codon_one_dimen = list(set(np.array(start_codon).flatten()))
+            # stop_codon 
+            stop_codon = transcript_info.loc[transcript_info["type"] == "stop_codon"]
+            stop_codon_frame = dict(zip(list(zip(stop_codon["start"],stop_codon["end"])),stop_codon["frame"]))
+            stop_codon = tuple(zip(stop_codon["start"],stop_codon["end"]))
+            stop_codon_one_dimen = list(set(np.array(stop_codon).flatten()))
+            # 5'UTR
+            five_UTR = transcript_info.loc[transcript_info["type"] == "5UTR"]
+            five_UTR = list(zip(five_UTR["start"],five_UTR["end"]))
+            # cds region
+            cds_region_df = transcript_info.loc[transcript_info["type"] == "CDS"]
+            cds_region = dict(zip(list(zip(cds_region_df["start"],cds_region_df["end"])),cds_region_df["frame"]))
+            # annotation
+            annotation = None
+            if min(start_codon_one_dimen) > te_end:
+                annotation = "non_coding"
+            elif max(stop_codon_one_dimen) <= template_exon[-1]:
+                annotation = "protein_coding"                                
+            novel_transcript = novelTranscript(gene_id = gene_id,
+                                               gene_name = gene_name,
+                                               transcript_id = filtered_transcript,
+                                               exon = novel_transcript_exon,
+                                               start_codon = start_codon_frame,
+                                               stop_codon = stop_codon_frame,
+                                               five_UTR = five_UTR,
+                                               strand = strand,
+                                               annotation = annotation,
+                                               cds = cds_region)
+            composite_transcript_dic.setdefault(region,[]).append(novel_transcript)
+        elif strand == "-":
+            # up exon
+            up_possible_transcripts = exon_info.loc[exon_info["start"] == up_site + 1,]
+            up_possible_transcripts = up_possible_transcripts.loc[up_possible_transcripts["type"] == "exon",]
+            up_possible_transcripts_set = set(up_possible_transcripts["transcript_id"])
+            # template exon
+            tem_possible_transcripts = exon_info.loc[(exon_info["end"] == te_end) & (exon_info["start"] > te_start),]
+            tem_possible_transcripts = tem_possible_transcripts.loc[tem_possible_transcripts["type"] == "exon",]
+            tem_possible_transcripts_set = set(tem_possible_transcripts["transcript_id"])
+            # select template transcript
+            transcript_intersection = up_possible_transcripts_set.intersection(tem_possible_transcripts_set)
+            if len(transcript_intersection) == 1:
+                filtered_transcript = list(transcript_intersection)[0]
+            else:
+                if len(transcript_intersection) > 1:
+                    filtered_transcripts = list(transcript_intersection)
+                else:
+                    filtered_transcripts = list(tem_possible_transcripts_set)
+                    up_site = te_end + 2
+                filtered_transcript_df = exon_info.loc[gtf_iv_df["transcript_id"].isin(filtered_transcripts),]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["type"]=="exon",]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["end"]>=te_end,]
+                filtered_transcript_df["len"] = filtered_transcript_df["end"] - filtered_transcript_df["start"] + 1
+                filtered_transcript_len_df = filtered_transcript_df.loc[:,["transcript_id","len"]].groupby(by=["transcript_id"]).sum()
+                filtered_transcript = filtered_transcript_len_df["len"].idxmax()        
+            # exon of transcript
+            transcript_exon_info = exon_info.loc[(exon_info["type"] == "exon") & (exon_info["transcript_id"] == filtered_transcript)]
+            transcript_exon_info = transcript_exon_info.sort_values(by = ["chrom","start"],
+                                                                    ascending = False)
+            exon_coordinate = list(zip(transcript_exon_info["start"],transcript_exon_info["end"]))
+            exon_coordinate = sorted(exon_coordinate,key = lambda x:x[0],reverse = True) 
+            coordinate_iv = dict()
+            for ec in exon_coordinate:
+                coordinate_iv[ec[0]] = ec
+                coordinate_iv[ec[1]] = ec
+            template_exon = coordinate_iv.get(te_end,[0,0])
+            novel_transcript_info = transcript_exon_info.loc[transcript_exon_info["start"] >= up_site + 1,]
+            novel_transcript_exon = list(zip(novel_transcript_info["start"],
+                                             novel_transcript_info["end"]))
+            novel_transcript_exon.append((te_start,te_end))
+            # info of transcript
+            transcript_info = exon_info.loc[(exon_info["transcript_id"] == filtered_transcript)]
+            # start codon
+            start_codon = transcript_info.loc[transcript_info["type"] == "start_codon"]
+            start_codon_frame = dict(zip(list(zip(start_codon["start"],start_codon["end"])),start_codon["frame"]))
+            start_codon = tuple(zip(start_codon["start"],start_codon["end"]))
+            start_codon_one_dimen = list(set(np.array(start_codon).flatten()))
+            # stop_codon 
+            stop_codon = transcript_info.loc[transcript_info["type"] == "stop_codon"]
+            stop_codon_frame = dict(zip(list(zip(stop_codon["start"],stop_codon["end"])),stop_codon["frame"]))
+            stop_codon = tuple(zip(stop_codon["start"],stop_codon["end"]))
+            stop_codon_one_dimen = list(set(np.array(stop_codon).flatten()))
+            # 5'UTR
+            five_UTR = transcript_info.loc[transcript_info["type"] == "5UTR"]
+            five_UTR = list(zip(five_UTR["start"],five_UTR["end"]))
+            # cds region
+            cds_region_df = transcript_info.loc[transcript_info["type"] == "CDS"]
+            cds_region = dict(zip(list(zip(cds_region_df["start"],cds_region_df["end"])),cds_region_df["frame"]))
+            # annotation
+            annotation = None
+            if max(start_codon_one_dimen) < te_start:
+                annotation = "non_coding"
+            elif min(stop_codon_one_dimen) >= template_exon[0]:
+                annotation = "protein_coding"                               
+            novel_transcript = novelTranscript(gene_id = gene_id,
+                                               gene_name = gene_name,
+                                               transcript_id = filtered_transcript,
+                                               exon = novel_transcript_exon,
+                                               start_codon = start_codon_frame,
+                                               stop_codon= stop_codon_frame,
+                                               five_UTR = five_UTR,
+                                               strand = strand,
+                                               annotation = annotation,
+                                               cds = cds_region)
+            composite_transcript_dic.setdefault(region,[]).append(novel_transcript)
+    return composite_transcript_dic
+
+def determinCoding(region_transcript_dic,
+                   genome):
+    log.info("Determin whether the transcript is coding RNA...")
+    stop_codons = ['TAA', 'TAG', 'TGA']
+    region_transcript_annotation_dic = dict()
+    protein_regions = set()
+    for region,transcripts in region_transcript_dic.items():
+        transcripts = [transcript.to_dict() for transcript in transcripts]
+        # delete same interval
+        if len(transcripts) > 1:
+            transcript_df = pd.DataFrame(transcripts).drop_duplicates(subset = ["gene_id",
+                                                                                "strand",
+                                                                                "exon",
+                                                                                "annotation"],keep="first")
+            transcripts = list(transcript_df.to_dict(orient="index").values())
+        for transcript in transcripts:
+            annotation = transcript["annotation"]
+            if annotation == "non_coding":
+                transcript["CDS"] = None
+                transcript["start_codon"] = None
+                transcript["stop_codon"] = None
+                region_transcript_annotation_dic.setdefault(region,[]).append(transcript)
+            elif annotation == "protein_coding":
+                region_transcript_annotation_dic.setdefault(region,[]).append(transcript)
+                protein_regions.add(region)
+            else:
+                chrom,gene_id = transcript["gene_id"].split(":")
+                strand = transcript["strand"]
+                all_exons = list(transcript["exon"])
+                start_codon_frame = transcript["start_codon"]
+                start_codon = tuple(start_codon_frame.keys())
+                start_codon_first = None
+                if strand == "+":
+                    start_codon = sorted(start_codon)
+                    if len(start_codon) == 2:
+                        start_codon_first = start_codon[0]
+                        start_codon = start_codon[1]
+                    elif len(start_codon) == 1:
+                        start_codon = start_codon[0]
+                    check_start_codon_border = start_codon[1] in np.array(all_exons).flatten()
+                elif strand == "-":
+                    start_codon = sorted(start_codon,reverse=True)
+                    if len(start_codon) == 2:
+                        start_codon_first = start_codon[0]
+                        start_codon = start_codon[1]
+                    elif len(start_codon) == 1:
+                        start_codon = start_codon[0]
+                    check_start_codon_border = start_codon[0] in np.array(all_exons).flatten()
+                all_exons.append(start_codon)
+                all_exon_coordinates = np.array(list(set([y for x in all_exons for y in x])))
+                cds_regions = transcript["CDS"]
+                if strand == "+":
+                    all_exon_coordinates = list(all_exon_coordinates[all_exon_coordinates >= start_codon[0]])
+                    if not check_start_codon_border:
+                        all_exon_coordinates.remove(start_codon[1])
+                    all_exon_coordinates = sorted(all_exon_coordinates)
+                    potential_cds_regions = [(all_exon_coordinates[x],
+                                              all_exon_coordinates[x+1]) for x in range(0,len(all_exon_coordinates),2)]
+                    if start_codon_first:
+                        potential_cds_regions.append(start_codon_first)
+                    potential_cds_regions = sorted(potential_cds_regions)
+                    if len(potential_cds_regions) == 1:
+                        potential_cds_regions = potential_cds_regions[0]
+                        potential_cds_region_seq = genome.sequence(
+                                            {
+                                                'chr': chrom,
+                                                'start': potential_cds_regions[0],
+                                                'stop': potential_cds_regions[1],
+                                                'strand': strand
+                                            }
+                                        )
+                        stop_codon_position_index = None
+                        for i in range(0,len(potential_cds_region_seq),3):
+                            if potential_cds_region_seq[i:i+3].upper() in stop_codons:
+                                stop_codon_position_index = i
+                                break
+                        if stop_codon_position_index is not None:
+                            stop_codon_position = (potential_cds_regions[0]+stop_codon_position_index,
+                                                   potential_cds_regions[0]+stop_codon_position_index+2)
+                            stop_codon_position_frame = {stop_codon_position:0}
+                            novel_cds = (potential_cds_regions[0],
+                                         potential_cds_regions[0]+stop_codon_position_index-1)
+                            transcript["annotation"] = "protein_coding"
+                            transcript["CDS"] = {novel_cds:0}
+                            transcript["stop_codon"] = stop_codon_position_frame
+                            protein_regions.add(region)
+                        else:
+                            transcript["annotation"] = "non_coding"
+                            transcript["CDS"] = None
+                        region_transcript_annotation_dic.setdefault(region,[]).append(transcript)
+                    else:
+                        exist_cds_region = potential_cds_regions[:-1]
+                        transcript_stop_codon_frame = transcript["stop_codon"]
+                        if len(transcript_stop_codon_frame) == 1:
+                            assert len(set(exist_cds_region).difference(set(cds_regions.keys()))) == 0
+                            last_exon = potential_cds_regions[-1]
+                            penultimate_exon = potential_cds_regions[-2]
+                            penultimate_exon_frame = cds_regions[penultimate_exon]
+                        elif len(transcript_stop_codon_frame) == 2:
+                            last_exon = potential_cds_regions[-1]
+                            penultimate_exon = potential_cds_regions[-2]
+                            penultimate_exon_st = penultimate_exon[0]
+                            penultimate_exon_frame = [v for k,v in cds_regions.items() if k[0] == penultimate_exon_st]
+                            assert len(penultimate_exon_frame) == 1
+                            penultimate_exon_frame = penultimate_exon_frame[0]
+                            cds_regions[penultimate_exon] = penultimate_exon_frame
+                        penultimate_CDS_seq = genome.sequence(
+                            {
+                                'chr': chrom,
+                                'start': penultimate_exon[0] + penultimate_exon_frame,
+                                'stop': penultimate_exon[1],
+                                'strand': strand
+                            }
+                        )
+                        bases_left = len(penultimate_CDS_seq) % 3
+                        if bases_left == 0:
+                            possible_last_exon_frame = 0
+                            previous_bases = ''
+                        elif bases_left > 0:
+                            possible_last_exon_frame = 3 - bases_left
+                            previous_bases = penultimate_CDS_seq[-bases_left:]
+                        last_exon_CDS_seq = genome.sequence(
+                            {
+                                'chr': chrom,
+                                'start': last_exon[0],
+                                'stop': last_exon[1],
+                                'strand': strand
+                            }
+                        )
+                        up_tail_merge_last_exon_CDS_seq = previous_bases + last_exon_CDS_seq
+                        stop_codon_position_index = None
+                        for i in range(0,len(up_tail_merge_last_exon_CDS_seq),3):
+                            if up_tail_merge_last_exon_CDS_seq[i:i+3].upper() in stop_codons:
+                                stop_codon_position_index = i
+                                break
+                        if stop_codon_position_index is not None:
+                            protein_regions.add(region)
+                            if (stop_codon_position_index == 0) and (bases_left > 0):
+                                if bases_left == 1:
+                                    stop_codon_position_first = (penultimate_exon[-1],penultimate_exon[-1])
+                                    stop_codon_position_second = (last_exon[0],last_exon[0]+1)
+                                    stop_codon_position_frame = {stop_codon_position_first:0,
+                                                                 stop_codon_position_second:2}
+                                    novel_cds_frame = {x:cds_regions[x] for x in exist_cds_region[:-1]}
+                                    novel_cds_frame.update({(penultimate_exon[0],penultimate_exon[-1]-1):penultimate_exon_frame})
+                                    transcript["annotation"] = "protein_coding"
+                                    transcript["CDS"] = novel_cds_frame
+                                    transcript["stop_codon"] = stop_codon_position_frame
+                                elif bases_left == 2:
+                                    stop_codon_position_first = (penultimate_exon[-1]-1,penultimate_exon[-1])
+                                    stop_codon_position_second = (last_exon[0],last_exon[0])
+                                    stop_codon_position_frame = {stop_codon_position_first:0,
+                                                                 stop_codon_position_second:1}
+                                    novel_cds_frame = {x:cds_regions[x] for x in exist_cds_region[:-1]}
+                                    novel_cds_frame.update({(penultimate_exon[0],penultimate_exon[-1]-2):penultimate_exon_frame})
+                                    transcript["annotation"] = "protein_coding"
+                                    transcript["CDS"] = novel_cds_frame
+                                    transcript["stop_codon"] = stop_codon_position_frame                                    
+                            elif (stop_codon_position_index >= bases_left):                
+                                stop_codon_position = (last_exon[0]-bases_left+stop_codon_position_index,
+                                                       last_exon[0]-bases_left+stop_codon_position_index+2)
+                                stop_codon_position_frame = {stop_codon_position:0}
+                                novel_cds_frame = {x:cds_regions[x] for x in exist_cds_region}                        
+                                last_cds = (last_exon[0],last_exon[0]-bases_left+stop_codon_position_index-1)
+                                if stop_codon_position_index > 0:
+                                    novel_cds_frame.update({last_cds:possible_last_exon_frame})
+                                transcript["annotation"] = "protein_coding"
+                                transcript["CDS"] = novel_cds_frame
+                                transcript["stop_codon"] = stop_codon_position_frame
+                        else:
+                            transcript["annotation"] = "non_coding"
+                            transcript["CDS"] = None
+                        region_transcript_annotation_dic.setdefault(region,[]).append(transcript)
+                elif strand == "-":
+                    all_exon_coordinates = list(all_exon_coordinates[all_exon_coordinates <= start_codon[1]])
+                    if not check_start_codon_border:
+                        all_exon_coordinates.remove(start_codon[0])
+                    all_exon_coordinates = sorted(all_exon_coordinates,reverse=True)
+                    potential_cds_regions = [(all_exon_coordinates[x+1],all_exon_coordinates[x]) for x in range(0,len(all_exon_coordinates),2)]
+                    if start_codon_first:
+                        potential_cds_regions.append(start_codon_first)
+                    potential_cds_regions = sorted(potential_cds_regions,reverse=True)
+                    if len(potential_cds_regions) == 1:
+                        potential_cds_regions = potential_cds_regions[0]
+                        potential_cds_region_seq = genome.sequence(
+                                            {
+                                                'chr': chrom,
+                                                'start': potential_cds_regions[0],
+                                                'stop': potential_cds_regions[1],
+                                                'strand': strand
+                                            }
+                                        )
+                        stop_codon_position_index = None
+                        for i in range(0,len(potential_cds_region_seq),3):
+                            if potential_cds_region_seq[i:i+3].upper() in stop_codons:
+                                stop_codon_position_index = i
+                                break
+                        if stop_codon_position_index is not None:
+                            stop_codon_position = (potential_cds_regions[1]-stop_codon_position_index-2,
+                                                   potential_cds_regions[1]-stop_codon_position_index)
+                            stop_codon_position_frame = {stop_codon_position:0}
+                            novel_cds = (potential_cds_regions[1]-stop_codon_position_index+1,
+                                         potential_cds_regions[1])
+                            transcript["annotation"] = "protein_coding"
+                            transcript["CDS"] = {novel_cds:0}
+                            transcript["stop_codon"] = stop_codon_position_frame
+                            protein_regions.add(region)
+                        else:
+                            transcript["annotation"] = "non_coding"
+                            transcript["CDS"] = None
+                        region_transcript_annotation_dic.setdefault(region,[]).append(transcript)
+                    else:                    
+                        exist_cds_region = potential_cds_regions[:-1]
+                        # modify 20221019
+                        transcript_stop_codon_frame = transcript["stop_codon"]
+                        if len(transcript_stop_codon_frame) == 1:
+                            assert len(set(exist_cds_region).difference(set(cds_regions.keys()))) == 0
+                            last_exon = potential_cds_regions[-1]
+                            penultimate_exon = potential_cds_regions[-2]
+                            penultimate_exon_frame = cds_regions[penultimate_exon]
+                        elif len(transcript_stop_codon_frame) == 2:
+                            last_exon = potential_cds_regions[-1]
+                            penultimate_exon = potential_cds_regions[-2]
+                            penultimate_exon_end = penultimate_exon[1]
+                            penultimate_exon_frame = [v for k,v in cds_regions.items() if k[1] == penultimate_exon_end]
+                            assert len(penultimate_exon_frame) == 1
+                            penultimate_exon_frame = penultimate_exon_frame[0]
+                            cds_regions[penultimate_exon] = penultimate_exon_frame
+                        penultimate_CDS_seq = genome.sequence(
+                            {
+                                'chr': chrom,
+                                'start': penultimate_exon[0],
+                                'stop': penultimate_exon[1] - penultimate_exon_frame,
+                                'strand': strand
+                            }
+                        )
+                        bases_left = len(penultimate_CDS_seq) % 3
+                        if bases_left == 0:
+                            possible_last_exon_frame = 0
+                            previous_bases = ''
+                        elif bases_left > 0:
+                            possible_last_exon_frame = 3 - bases_left
+                            previous_bases = penultimate_CDS_seq[-bases_left:]
+                        last_exon_CDS_seq = genome.sequence(
+                            {
+                                'chr': chrom,
+                                'start': last_exon[0],
+                                'stop': last_exon[1],
+                                'strand': strand
+                            }
+                        )
+                        up_tail_merge_last_exon_CDS_seq = previous_bases + last_exon_CDS_seq
+                        stop_codon_position_index = None
+                        for i in range(0,len(up_tail_merge_last_exon_CDS_seq),3):
+                            if up_tail_merge_last_exon_CDS_seq[i:i+3].upper() in stop_codons:
+                                stop_codon_position_index = i
+                                break
+                        if stop_codon_position_index is not None:
+                            protein_regions.add(region)
+                            if (stop_codon_position_index == 0) and (bases_left > 0):
+                                if bases_left == 1:
+                                    stop_codon_position_first = (penultimate_exon[0],penultimate_exon[0])
+                                    stop_codon_position_second = (last_exon[-1]-1,last_exon[-1])
+                                    stop_codon_position_frame = {stop_codon_position_first:0,
+                                                                 stop_codon_position_second:2}
+                                    novel_cds_frame = {x:cds_regions[x] for x in exist_cds_region[:-1]}
+                                    novel_cds_frame.update({(penultimate_exon[0]+1,penultimate_exon[1]):penultimate_exon_frame})
+                                    transcript["annotation"] = "protein_coding"
+                                    transcript["CDS"] = novel_cds_frame
+                                    transcript["stop_codon"] = stop_codon_position_frame
+                                elif bases_left == 2:
+                                    stop_codon_position_first = (penultimate_exon[0],penultimate_exon[0]+1)
+                                    stop_codon_position_second = (last_exon[-1],last_exon[-1])
+                                    stop_codon_position_frame = {stop_codon_position_first:0,
+                                                                 stop_codon_position_second:1}
+                                    novel_cds_frame = {x:cds_regions[x] for x in exist_cds_region[:-1]}
+                                    novel_cds_frame.update({(penultimate_exon[0]+2,penultimate_exon[1]):penultimate_exon_frame})
+                                    transcript["annotation"] = "protein_coding"
+                                    transcript["CDS"] = novel_cds_frame
+                                    transcript["stop_codon"] = stop_codon_position_frame                                                                                  
+                            elif (stop_codon_position_index >= bases_left):                
+                                stop_codon_position = (last_exon[1]+bases_left-stop_codon_position_index-2,
+                                                       last_exon[1]+bases_left-stop_codon_position_index)
+                                stop_codon_position_frame = {stop_codon_position:0}
+                                novel_cds_frame = {x:cds_regions[x] for x in exist_cds_region}                        
+                                last_cds = (last_exon[1]+bases_left-stop_codon_position_index+1,last_exon[1])    
+                                if stop_codon_position_index > 0:
+                                    novel_cds_frame.update({last_cds:possible_last_exon_frame})
+                                transcript["annotation"] = "protein_coding"
+                                transcript["CDS"] = novel_cds_frame
+                                transcript["stop_codon"] = stop_codon_position_frame
+                        else:
+                            transcript["annotation"] = "non_coding"
+                            transcript["CDS"] = None
+                        region_transcript_annotation_dic.setdefault(region,[]).append(transcript)
+    log.info("Total number : %d" % len(region_transcript_annotation_dic))   
+    log.info("Protein coding number : %d" % len(protein_regions))
+    return region_transcript_annotation_dic  
+
+
+def skipTranscript(rt_te_skip):
+    log.info("Extract info of skip transcript...")
+    skip_transcript_dic = dict()
+    for x in rt_te_skip.itertuples():
+        region = x.region
+        chrom,te_start,te_end,strand,gn = region.split(":")
+        te_start,te_end = int(te_start),int(te_end)
+        gene_id = x.gene_id
+        possible_up_sites = x.possible_five_ss.split(",")
+        possible_up_locs = np.array([int(x.split(":")[1]) for x in possible_up_sites])
+        if strand == "+":
+            possible_up_site = possible_up_sites[possible_up_locs.argmax()]
+        elif strand == "-":
+            possible_up_site = possible_up_sites[possible_up_locs.argmin()]
+        up_site = int(possible_up_site.split(":")[1])
+        exon_info = gtf_iv_df.loc[gtf_iv_df["gene_id"] == gene_id,]
+        gene_name = list(set(exon_info["gene_name"]))
+        assert len(gene_name) == 1
+        gene_name = gene_name[0]
+        # intron region
+        tem_exon_info = exon_info.loc[exon_info["type"]=="exon",]
+        tem_transcripts = set(tem_exon_info["transcript_id"])
+        tem_transcript_intron_coordinate_ls = list()
+        for transcript in tem_transcripts:
+            transcript_exon_df = tem_exon_info.loc[tem_exon_info["transcript_id"]==transcript,]
+            transcript_exon_coordinates = sorted(list(transcript_exon_df["start"]) + list(transcript_exon_df["end"]))
+            transcript_exon_coordinates.pop(0)
+            transcript_exon_coordinates.pop(-1)
+            for i in range(0,len(transcript_exon_coordinates),2):
+                tem_transcript_intron_coordinate_ls.append(transcript_exon_coordinates[i:i+2] + [transcript])
+        intron_coordinate_df = pd.DataFrame(tem_transcript_intron_coordinate_ls)  
+        # tem
+        tem_possible_transcripts = intron_coordinate_df.loc[(intron_coordinate_df[0] < te_start) & (intron_coordinate_df[1] > te_end),]
+        tem_possible_transcripts_set = set(tem_possible_transcripts[2])
+        if strand == "+":
+            # up
+            up_possible_transcripts = exon_info.loc[exon_info["end"] == up_site,]
+            up_possible_transcripts = up_possible_transcripts.loc[up_possible_transcripts["type"] == "exon",]
+            up_possible_transcripts_set = set(up_possible_transcripts["transcript_id"])
+            # same transcript
+            transcript_intersection = up_possible_transcripts_set.intersection(tem_possible_transcripts_set)
+            # select template transcript
+            transcript_intersection = up_possible_transcripts_set.intersection(tem_possible_transcripts_set)
+            if len(transcript_intersection) == 1:
+                filtered_transcript = list(transcript_intersection)[0]
+            else:
+                if len(transcript_intersection) > 1:
+                    filtered_transcripts = list(transcript_intersection)
+                else:
+                    filtered_transcripts = list(tem_possible_transcripts_set)
+                    up_site = te_start - 2
+                filtered_transcript_df = exon_info.loc[gtf_iv_df["transcript_id"].isin(filtered_transcripts),]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["type"]=="exon",]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["start"]<=te_start,]
+                filtered_transcript_df["len"] = filtered_transcript_df["end"] - filtered_transcript_df["start"] + 1
+                filtered_transcript_len_df = filtered_transcript_df.loc[:,["transcript_id","len"]].groupby(by=["transcript_id"]).sum()
+                filtered_transcript = filtered_transcript_len_df["len"].idxmax()
+            # exon of transcript
+            transcript_exon_info = exon_info.loc[(exon_info["type"] == "exon") & (exon_info["transcript_id"] == filtered_transcript)]
+            transcript_exon_info = transcript_exon_info.sort_values(by = ["chrom","start"])
+            exon_coordinate = list(zip(transcript_exon_info["start"],transcript_exon_info["end"]))
+            exon_coordinate_index_dic = {ec:index+1 for index,ec in enumerate(exon_coordinate)}
+            exon_coordinate_index_dic = {ec:v for k,v in exon_coordinate_index_dic.items() for ec in k} 
+            # add terminal exon
+            exon_te_coordinate = sorted(list(exon_coordinate_index_dic.keys()) + [te_start,te_end])
+            te_start_index = exon_te_coordinate.index(te_start)
+            te_end_index = exon_te_coordinate.index(te_end)
+            if ((te_end_index - te_start_index) == 1) and (te_start_index % 2 == 0):
+                novel_transcript_info = transcript_exon_info.loc[transcript_exon_info["end"] <= up_site,]
+                novel_transcript_exon = list(zip(novel_transcript_info["start"],
+                                                 novel_transcript_info["end"]))
+                novel_transcript_exon.append((te_start,te_end))
+                # info of transcript
+                transcript_info = exon_info.loc[(exon_info["transcript_id"] == filtered_transcript)]
+                # start codon
+                start_codon = transcript_info.loc[transcript_info["type"] == "start_codon"]
+                start_codon_frame = dict(zip(list(zip(start_codon["start"],start_codon["end"])),start_codon["frame"]))
+                start_codon = tuple(zip(start_codon["start"],start_codon["end"]))
+                start_codon_one_dimen = list(set(np.array(start_codon).flatten()))
+                # stop_codon 
+                stop_codon = transcript_info.loc[transcript_info["type"] == "stop_codon"]
+                stop_codon_frame = dict(zip(list(zip(stop_codon["start"],stop_codon["end"])),stop_codon["frame"]))
+                stop_codon = tuple(zip(stop_codon["start"],stop_codon["end"]))
+                stop_codon_one_dimen = list(set(np.array(stop_codon).flatten()))
+                # 5'UTR
+                five_UTR = transcript_info.loc[transcript_info["type"] == "5UTR"]
+                five_UTR = list(zip(five_UTR["start"],five_UTR["end"]))
+                # cds region
+                cds_region_df = transcript_info.loc[transcript_info["type"] == "CDS"]
+                cds_region = dict(zip(list(zip(cds_region_df["start"],cds_region_df["end"])),cds_region_df["frame"]))
+                # annotation
+                annotation = None
+                if min(start_codon_one_dimen) > te_end:
+                    annotation = "non_coding"
+                elif max(stop_codon_one_dimen) < te_end:
+                    annotation = "protein_coding"                            
+                novel_transcript = novelTranscript(gene_id = gene_id,
+                                                   gene_name = gene_name,
+                                                   transcript_id = filtered_transcript,
+                                                   exon = novel_transcript_exon,
+                                                   start_codon = start_codon_frame,
+                                                   stop_codon = stop_codon_frame,
+                                                   five_UTR = five_UTR,
+                                                   strand = strand,
+                                                   annotation = annotation,
+                                                   cds = cds_region)
+                skip_transcript_dic.setdefault(region,[]).append(novel_transcript)
+        elif strand == "-":
+            # up exon
+            up_possible_transcripts = exon_info.loc[exon_info["start"] == up_site + 1,]
+            up_possible_transcripts = up_possible_transcripts.loc[up_possible_transcripts["type"] == "exon",]
+            up_possible_transcripts_set = set(up_possible_transcripts["transcript_id"])
+            # select template transcript
+            transcript_intersection = up_possible_transcripts_set.intersection(tem_possible_transcripts_set)
+            if len(transcript_intersection) == 1:
+                filtered_transcript = list(transcript_intersection)[0]
+            else:
+                if len(transcript_intersection) > 1:
+                    filtered_transcripts = list(transcript_intersection)
+                else:
+                    filtered_transcripts = list(tem_possible_transcripts_set)
+                    up_site = te_end + 2
+                filtered_transcript_df = exon_info.loc[gtf_iv_df["transcript_id"].isin(filtered_transcripts),]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["type"]=="exon",]
+                filtered_transcript_df = filtered_transcript_df.loc[filtered_transcript_df["end"]>=te_end,]
+                filtered_transcript_df["len"] = filtered_transcript_df["end"] - filtered_transcript_df["start"] + 1
+                filtered_transcript_len_df = filtered_transcript_df.loc[:,["transcript_id","len"]].groupby(by=["transcript_id"]).sum()
+                filtered_transcript = filtered_transcript_len_df["len"].idxmax()
+            # exon of transcript
+            transcript_exon_info = exon_info.loc[(exon_info["type"] == "exon") & (exon_info["transcript_id"] == filtered_transcript)]
+            transcript_exon_info = transcript_exon_info.sort_values(by = ["chrom","start"],
+                                                                    ascending = False)
+            exon_coordinate = list(zip(transcript_exon_info["start"],transcript_exon_info["end"]))
+            exon_coordinate = sorted(exon_coordinate,key = lambda x:x[0],reverse = True)
+            exon_coordinate_index_dic = {ec:index+1 for index,ec in enumerate(exon_coordinate)}
+            exon_coordinate_index_dic = {ec:v for k,v in exon_coordinate_index_dic.items() for ec in k}
+            # add terminal exon
+            exon_te_coordinate = sorted(list(exon_coordinate_index_dic.keys()) + [te_start,te_end])
+            te_start_index = exon_te_coordinate.index(te_start)
+            te_end_index = exon_te_coordinate.index(te_end)
+            if ((te_end_index - te_start_index) == 1) and (te_start_index % 2 == 0):
+                novel_transcript_info = transcript_exon_info.loc[transcript_exon_info["start"] >= up_site + 1,]
+                novel_transcript_exon = list(zip(novel_transcript_info["start"],
+                                                 novel_transcript_info["end"]))
+                novel_transcript_exon.append((te_start,te_end))
+                # info of transcript
+                transcript_info = exon_info.loc[(exon_info["transcript_id"] == filtered_transcript)]
+                # start codon
+                start_codon = transcript_info.loc[transcript_info["type"] == "start_codon"]
+                start_codon_frame = dict(zip(list(zip(start_codon["start"],start_codon["end"])),start_codon["frame"]))
+                start_codon = tuple(zip(start_codon["start"],start_codon["end"]))
+                start_codon_one_dimen = list(set(np.array(start_codon).flatten()))
+                # stop_codon 
+                stop_codon = transcript_info.loc[transcript_info["type"] == "stop_codon"]
+                stop_codon_frame = dict(zip(list(zip(stop_codon["start"],stop_codon["end"])),stop_codon["frame"]))
+                stop_codon = tuple(zip(stop_codon["start"],stop_codon["end"]))
+                stop_codon_one_dimen = list(set(np.array(stop_codon).flatten()))
+                # 5'UTR
+                five_UTR = transcript_info.loc[transcript_info["type"] == "5UTR"]
+                five_UTR = list(zip(five_UTR["start"],five_UTR["end"]))
+                # cds region
+                cds_region_df = transcript_info.loc[transcript_info["type"] == "CDS"]
+                cds_region = dict(zip(list(zip(cds_region_df["start"],cds_region_df["end"])),cds_region_df["frame"]))
+                # annotation
+                annotation = None
+                if max(start_codon_one_dimen) < te_start:
+                    annotation = "non_coding"
+                elif min(stop_codon_one_dimen) > te_start: 
+                    annotation = "protein_coding" 
+                novel_transcript = novelTranscript(gene_id = gene_id,
+                                                   gene_name = gene_name,
+                                                   transcript_id = filtered_transcript,
+                                                   exon = novel_transcript_exon,
+                                                   start_codon = start_codon_frame,
+                                                   stop_codon = stop_codon_frame,                                                        
+                                                   five_UTR = five_UTR,
+                                                   strand = strand,
+                                                   annotation = annotation,
+                                                   cds = cds_region)
+                skip_transcript_dic.setdefault(region,[]).append(novel_transcript)    
+    return skip_transcript_dic
+
+
+def checkTranscript(transcript_dic,
+                    genome,
+                    feat):
+    # check start codon
+    log.info("Checking %s transcript..." % feat)
+    start_codon = "ATG"
+    for te_region,transcripts in transcript_dic.items():
+        chrom,te_start,te_end,strand,gn = te_region.split(":")
+        te_start,te_end = int(te_start),int(te_end)
+        for index,transcript in enumerate(transcripts):
+            annotation = transcript.annotation
+            if annotation == None:
+                exon_info = transcript.exon
+                exon_coordinate_dic = {y:i for i,x in enumerate(exon_info) for y in x}
+                exon_coordinate = list(exon_coordinate_dic.keys())
+                st_condon_info = transcript.start_codon
+                st_condon_info = list(st_condon_info.keys())
+                st_condon_info = [y for x in st_condon_info for y in x]
+                st_condon_info = list(set(st_condon_info).difference(set(exon_coordinate)))
+                exon_st_list = exon_coordinate + st_condon_info
+                exon_st_list = sorted(exon_st_list)
+                min_st_index = exon_st_list.index(min(st_condon_info))
+                max_st_index = exon_st_list.index(max(st_condon_info))
+                if (min_st_index > 0) and (max_st_index + 1 < len(exon_st_list)):
+                    left_exon_loc = exon_coordinate_dic[exon_st_list[min_st_index-1]]
+                    right_exon_loc = exon_coordinate_dic[exon_st_list[max_st_index+1]]
+                else:
+                    left_exon_loc = -1
+                    right_exon_loc = -2 
+                if left_exon_loc != right_exon_loc:
+                    te_seqs = genome.sequence({'chr': chrom,
+                                               'start': te_start,
+                                               'stop': te_end,
+                                               'strand': strand})
+                    te_seqs = te_seqs.upper()
+                    start_index = te_seqs.find(start_codon)
+                    if start_index >= 0:
+                        if strand == "+":
+                            novel_st_codon_st = te_start + start_index
+                            novel_st_codon = {(novel_st_codon_st,novel_st_codon_st+2):0}
+                        elif strand == "-":
+                            novel_st_codon_end = te_end - start_index
+                            novel_st_codon = {(novel_st_codon_end-2,novel_st_codon_end):0}
+                        transcript_dic[te_region][index].start_codon = novel_st_codon
+                    else:
+                        transcript_dic[te_region][index].annotation = "non_coding"
+    return
+
+def getAnnotateGeneInfos(gtf_file_path,novel_terminal_genes):
+    log.info("Extract info of related annotated transcript...")
+    annotated_gtf_infos = []
+    with open(gtf_file_path) as hd:
+        for x in hd:
+            if "NM_" in x:
+                chr_gene_id = ":".join(re.search('(chr.*?)\t.*?gene_id "(.*?)"',x).groups())
+                if chr_gene_id in novel_terminal_genes:
+                    x = x.strip()
+                    annotated_gtf_infos.append(x.split("\t"))
+    return annotated_gtf_infos
+
+def getAllInfos(gtf_file_path):
+    log.info("Extract info of all annotated transcript...")
+    annotated_gtf_infos = []
+    with open(gtf_file_path) as hd:
+        for x in hd:
+            if "NM_" in x:
+                x = x.strip()
+                annotated_gtf_infos.append(x.split("\t"))
+    return annotated_gtf_infos
+
+def transGTFormat(region,
+                  transcript,
+                  te_type,
+                  index,
+                  transcript_source = "InPACT"):
+    gtf_info = []
+    chrom,gene_id = transcript["gene_id"].split(":")
+    gene_id = 'gene_id "' + gene_id + '";'
+    gene_name = transcript["gene_name"]
+    gene_name = 'gene_name "' + gene_name + '";'
+    all_exons = transcript["exon"]
+    all_exon_coordinates = np.array(all_exons).flatten()
+    cds_frame = transcript["CDS"]      
+    strand = transcript["strand"]
+    annotation = transcript["annotation"]
+    template_transcript = transcript["transcript_id"]
+    if annotation == "protein_coding":
+        start_codon_frame = transcript["start_codon"]
+        start_codons = tuple(start_codon_frame.keys())
+        stop_codon_frame = transcript["stop_codon"]
+        stop_codons = tuple(stop_codon_frame.keys())
+        cds_regions = list(cds_frame.keys())
+        novel_transcript_id = "|".join(["novel_XM",template_transcript,te_type,"_".join(region.split(":")[1:3]),str(index)])    
+    elif annotation == "non_coding":
+        novel_transcript_id = "|".join(["novel_XR",template_transcript,te_type,"_".join(region.split(":")[1:3]),str(index)])
+    exon_id = 'exon_id "' + novel_transcript_id + '.%d";'
+    novel_transcript_id = 'transcript_id "' + novel_transcript_id + '";'
+    # transcript info
+    ipa_region = 'InPACT_TE "%s";' % region
+    transcript_attr = "".join([gene_id,novel_transcript_id,gene_name,ipa_region])
+    transcript_info = [chrom,transcript_source,"transcript",min(all_exon_coordinates),
+                       max(all_exon_coordinates),".",strand,".",transcript_attr]
+    gtf_info.append(transcript_info)        
+    # exon and cds
+    exon_number = 'exon_number "%d";'        
+    exon_attr = "".join([gene_id,novel_transcript_id,exon_number,exon_id,gene_name])
+    if strand == "+":
+        all_exons = sorted(all_exons)
+    elif strand == "-":
+        all_exons = sorted(all_exons,reverse=True)
+    for i,exon_st_end in enumerate(all_exons):
+        i += 1
+        exon_start = exon_st_end[0]
+        exon_end = exon_st_end[1]
+        exon_info = [chrom,transcript_source,"exon",exon_start,exon_end,
+                     ".",strand,".",exon_attr % (i,i)]
+        gtf_info.append(exon_info)
+        if annotation == "protein_coding":
+            check_cds = [x for x in cds_regions if (exon_start <= x[0]) and (exon_end >= x[1])]                
+            if check_cds:
+                assert len(check_cds) == 1
+                check_cds = check_cds[0]
+                cds_info = [chrom,transcript_source,"CDS",check_cds[0],check_cds[1],
+                            ".",strand,cds_frame[check_cds],exon_attr % (i,i)]
+                gtf_info.append(cds_info)
+            for start_codon in start_codons:
+                check_start = (exon_start <= start_codon[0]) and (exon_end >= start_codon[1])
+                if check_start:
+                    start_info = [chrom,transcript_source,"start_codon",start_codon[0],start_codon[1],
+                                  ".",strand,start_codon_frame[start_codon],exon_attr % (i,i)]
+                    gtf_info.append(start_info)
+            for stop_codon in stop_codons:
+                check_stop = (exon_start <= stop_codon[0]) and (exon_end >= stop_codon[1])
+                if check_stop:
+                    stop_info = [chrom,transcript_source,"stop_codon",stop_codon[0],stop_codon[1],
+                                 ".",strand,stop_codon_frame[stop_codon],exon_attr % (i,i)]
+                    gtf_info.append(stop_info)
+    return gtf_info
+
+def novelTranscriptToGtf(composite_annotation,
+                         skip_annotation):
+    novel_gtf_infos = []
+    # composite 
+    i = 0
+    log.info("Processing composite gtf...")
+    for region,transcripts in composite_annotation.items():
+        for transcript in transcripts:
+            i += 1
+            gtf_info = transGTFormat(region,
+                                     transcript,
+                                     "Composite",
+                                     i)
+            novel_gtf_infos.extend(gtf_info)
+    log.info("Composite transcripts : %d" % i)
+    # skip
+    i = 0
+    log.info("Processing skipped gtf...")
+    for region,transcripts in skip_annotation.items():
+        for transcript in transcripts:
+            i += 1
+            gtf_info = transGTFormat(region,
+                                     transcript,
+                                     "Skip",
+                                     i)
+            novel_gtf_infos.extend(gtf_info)
+    log.info("Skip transcripts : %d" % i)
+    return novel_gtf_infos
+
+def typeTrans(iv_type):
+    type_code = {
+        "transcript":1,
+        "exon":2,
+        "3UTR":3,
+        "CDS":4,
+        "5UTR":5,
+        "start_codon":6,
+        "stop_codon":7
+    }
+    return type_code[iv_type]
+
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Build transcript.')
+    # input and output
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--predict_terminal',
+            type = str,
+            help='Predicted terminal exon.')
+    g.add_argument(
+            '--annotated_gtf',
+            type = str,
+            help='Annotated GTF file.')
+    g.add_argument(
+            '--fa_path',
+            type = str,
+            help='Fasta path.')
+    g.add_argument(
+            '--novel_and_all_annotated',
+            type = bool,
+            help='save novel or all annotated gtf',
+            default = True)
+    g = p.add_argument_group('output')
+    g.add_argument(
+            '--save_gtf',
+            type = str,
+            help='Save GTF')
+    return p
+
+# run
+# parse args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+log.info("#"*25 + "Start : Build gtf" + "#"*25 + "\n")
+log.info("Parameters:")
+log.info(args)
+log.info("-"*30)
+# variable
+predicted_terminal_exon_path = args.predict_terminal
+RefSeq_gtf_file_path = args.annotated_gtf
+fasta_path = args.fa_path
+novel_and_all_annotated = args.novel_and_all_annotated
+save_gtf = args.save_gtf
+
+novel_terminal_genes,rt_te_skip,rt_te_composite = splitTerminal(predicted_terminal_exon_path)
+# read fasta
+genome = Fasta(fasta_path)
+# extrat info of gtf
+gtf_iv_df = ivFromGtf(RefSeq_gtf_file_path,novel_terminal_genes)
+# composite
+composite_transcript_dic = compositeTranscript(rt_te_composite)
+checkTranscript(composite_transcript_dic,genome,"Composite")
+composite_transcript_annotation_dic = determinCoding(composite_transcript_dic,
+                                                     genome)
+# skip
+skip_transcript_dic = skipTranscript(rt_te_skip)
+checkTranscript(skip_transcript_dic,genome,"Skip")
+skip_transcript_annotation_dic = determinCoding(skip_transcript_dic,
+                                                genome)
+# novel gtf
+novel_gtf_infos = novelTranscriptToGtf(composite_transcript_annotation_dic,
+                                       skip_transcript_annotation_dic)
+# annotated gtf
+if novel_and_all_annotated:
+    annotated_gtf_infos = getAllInfos(RefSeq_gtf_file_path)
+else:
+    annotated_gtf_infos = getAnnotateGeneInfos(RefSeq_gtf_file_path,novel_terminal_genes)
+# save
+annotated_novel_merge_infos = annotated_gtf_infos + novel_gtf_infos
+annotated_novel_df = pd.DataFrame(sorted(annotated_novel_merge_infos,
+                                         key = lambda x:[x[0],
+                                                         re.search('gene_id "(.*?)"',x[8]).groups()[0],
+                                                         re.search('transcript_id "(.*?)"',x[8]).groups()[0],
+                                                         x[3],
+                                                         typeTrans(x[2])]))
+annotated_novel_df.to_csv(save_gtf,sep="\t",index=False,header=False,quoting=3)
+log.info("#"*25 + "Done : Build gtf" + "#"*25 + "\n")
+
+
+
+

@@ -1,0 +1,165 @@
+#!/usr/bin/env python
+
+import re
+import sys
+import json
+import logging
+import argparse
+import pybedtools
+import numpy as np
+import pandas as pd
+
+# logging
+logging.basicConfig(format='%(asctime)s: %(message)s',
+                    datefmt = '%Y-%m-%d %H:%M')
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+
+def readJson(jsonfile):
+    with open(jsonfile,'r') as f:
+        json_dic = json.loads(f.read())
+    return json_dic
+
+class analysisPolya:
+    def __init__(self,
+                 polyA,
+                 feature_region,
+                 upstream_exons,
+                 closest_exons,
+                 chromosome,
+                 strand):
+        self.polyA = polyA
+        self.feature_region = feature_region
+        self.upstream_exons = upstream_exons
+        self.closest_exons = closest_exons
+        self.chromosome = chromosome
+        self.strand = strand
+        
+def writeCnt(filename,cnt):
+    with open(filename,"a") as a1:
+        a1.write(cnt)  
+    return
+
+def paFeatUpExon(pa_site,
+                 gene_exon_coordinate):
+    # pa_site : object of pybedtool
+    # info of polyA site
+    chromosome = pa_site.chrom
+    pa_start = pa_site.start
+    pa_end = pa_site.end
+    strand = pa_site.strand
+    gene_id = pa_site.name
+    pa_ls = [chromosome,pa_start,pa_end,gene_id,".",strand]
+    # determine featrue region
+    distance = np.inf
+    exons = gene_exon_coordinate[gene_id]["exons"]
+    upstream_exons = []
+    feature_region = None
+    if strand == "+":
+        for start,end in exons:
+            diff = pa_start - end
+            if diff >= 0:
+                upstream_exons.append((start,end))
+                if diff < distance:
+                    select_end = end
+                    feature_region = [gene_id,chromosome,end + 1,pa_start + 1,strand,":".join([str(pa_start),str(pa_end)])]
+                    distance = diff    
+        closest_exons = [(st,en) for st,en in upstream_exons if en == select_end]            
+    elif strand == "-":
+        for start,end in exons:
+            diff = start - pa_end
+            if diff >= 0:
+                upstream_exons.append((start,end))
+                if diff < distance:
+                    select_start = start
+                    feature_region = [gene_id,chromosome,pa_end,start,strand,":".join([str(pa_start),str(pa_end)])]
+                    distance = diff
+        closest_exons = [(st,en) for st,en in upstream_exons if st == select_start]        
+    if len(closest_exons) > 1:
+        exon_length_ls = list(map(lambda x:x[1]-x[0],closest_exons))
+        closest_exons = \
+                closest_exons[exon_length_ls.index(max(exon_length_ls))]  
+    elif len(closest_exons) == 1:
+        closest_exons = closest_exons[0]
+    if feature_region and upstream_exons and closest_exons:
+        return analysisPolya(pa_ls,
+                             feature_region,
+                             upstream_exons,
+                             closest_exons,
+                             chromosome,
+                             strand)
+    else:
+        return 0   
+    
+def generatorPaFeat(pa_bed_file,
+                    gene_exon_coordinate,
+                    number = 1000):
+    # read polyA bed
+    pa_bed = pybedtools.BedTool(pa_bed_file)
+    total_number = pa_bed.count()
+    log.info("Total polyA events : %d" % total_number)
+    read_number = 0
+    # determin feature region
+    i = 0
+    polya_feat_ls = []
+    for site in pa_bed:
+        pa_feat = paFeatUpExon(site,gene_exon_coordinate)
+        if pa_feat:
+            polya_feat_ls.append(pa_feat)
+            i += 1
+            read_number += 1
+            if (i == number) or (read_number == total_number):
+                log.info("Building polyA feature region : %d/%d" % (read_number,total_number))
+                yield polya_feat_ls
+                i = 0
+                polya_feat_ls = []
+        else:
+            total_number -= 1
+            
+def create_parser(name):
+    p = argparse.ArgumentParser( 
+            prog=name,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='Filter exons based on count of feat region.')
+    # input and output
+    g = p.add_argument_group('input')
+    g.add_argument(
+            '--intron_polya_file',
+            type = str,
+            help = 'PolyA file')
+    g.add_argument(
+            '--gene_exon_file',
+            help = 'json {gene:exon}',
+            type = str)
+    g.add_argument(
+            '--out_put',
+            help='Output file',
+            type=str)
+    return p    
+    
+# parse args
+args = sys.argv
+parser = create_parser(args[0])
+args = parser.parse_args(args[1:])
+intron_polya_file = args.intron_polya_file
+gene_exon_file = args.gene_exon_file
+out_put = args.out_put
+# run
+log.info("#"*25 + "Start:build feature region" + "#"*25)
+log.info("Parameter:")
+log.info(args)
+log.info("-"*30)
+gene_exon_coordinate = readJson(gene_exon_file)
+# write header
+columns = ["GeneID","Chr","Start","End","Strand","PolyA"]
+writeCnt(out_put,"\t".join(columns) + "\n")  
+# read bed
+polya_feat_lss = generatorPaFeat(intron_polya_file,
+                                 gene_exon_coordinate,
+                                 number = 50000)
+for polya_feat_ls in polya_feat_lss:
+    polya_feat_ls_feat = [x.feature_region for x in polya_feat_ls]
+    writeCnt(out_put,
+         "\n".join(map(lambda x:"\t".join(map(str,x)),polya_feat_ls_feat)) + "\n")
+log.info("#"*25 + "Done:build feature region" + "#"*25)

@@ -103,7 +103,7 @@ def writeExons(exon_df,terminal_bed_file,intermediate_bed_file,start_bed_file):
     return
 
 
-def write_non_overlapping_regions_to_bed(bed_in,bed_out):
+def nonOverlappingRegionsToBed(bed_in,bed_out):
     # custom header
     columns_custom_bed = ["chrom","start","end","gene_id","transcript_id","strand","count",]
     # normal header
@@ -123,11 +123,11 @@ def write_non_overlapping_regions_to_bed(bed_in,bed_out):
     selected_df.to_csv(bed_out,sep="\t",header=False,index=False)
     return
 
-def write_non_overlapping_regions(selected_bed,
-                                  compare_bed_1,
-                                  compare_bed_2,
-                                  strand,
-                                  bed_out):
+def nonOverlappingRegions(selected_bed,
+                          compare_bed_1,
+                          compare_bed_2,
+                          strand,
+                          bed_out):
     selected_bed = pybedtools.BedTool(selected_bed)
     compare_bed_1 = pybedtools.BedTool(compare_bed_1)
     compare_bed_2 = pybedtools.BedTool(compare_bed_2)
@@ -167,20 +167,18 @@ def extractTeInterExon(gtf_file_path,save_dir,save_terminal,save_intermediate):
                terminal_bed_file,
                intermediate_bed_file,
                start_bed_file)
-    write_non_overlapping_regions_to_bed(terminal_bed_file,
-                                         terminal_not_overlap_other_terminal_file)
-    write_non_overlapping_regions_to_bed(intermediate_bed_file,
-                                         intermediate_not_overlap_other_intermediate_file)
-    write_non_overlapping_regions(selected_bed = terminal_not_overlap_other_terminal_file,
-                                  compare_bed_1 = intermediate_bed_file,
-                                  compare_bed_2 = start_bed_file,
-                                  strand = False,
-                                  bed_out = terminal_not_overlap_start_intermediate)
-    write_non_overlapping_regions(selected_bed = intermediate_not_overlap_other_intermediate_file,
-                                  compare_bed_1 = terminal_bed_file,
-                                  compare_bed_2 = start_bed_file,
-                                  strand = False,
-                                  bed_out = intermediate_not_overlap_start_terminal)
+    nonOverlappingRegionsToBed(terminal_bed_file,terminal_not_overlap_other_terminal_file)
+    nonOverlappingRegionsToBed(intermediate_bed_file,intermediate_not_overlap_other_intermediate_file)
+    nonOverlappingRegions(selected_bed = terminal_not_overlap_other_terminal_file,
+                          compare_bed_1 = intermediate_bed_file,
+                          compare_bed_2 = start_bed_file,
+                          strand = False,
+                          bed_out = terminal_not_overlap_start_intermediate)
+    nonOverlappingRegions(selected_bed = intermediate_not_overlap_other_intermediate_file,
+                          compare_bed_1 = terminal_bed_file,
+                          compare_bed_2 = start_bed_file,
+                          strand = False,
+                          bed_out = intermediate_not_overlap_start_terminal)
     extractNM(terminal_not_overlap_start_intermediate,save_terminal)
     log.info("Save %s" % save_terminal)
     extractNM(intermediate_not_overlap_start_terminal,save_intermediate)

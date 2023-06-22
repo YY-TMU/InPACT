@@ -20,7 +20,7 @@ conda env create -f environment.yml
 conda activate InPACT
 ```
 
-3. Test that InPACT command is available:
+3. The installation takes about 5 to 8 minutes. If installation was sucessfull, InPACT command is available:
 ```
 InPACT -h
 ```
@@ -32,6 +32,9 @@ Based on the human reference genome (GRCh38), we provided an annotation of poten
 
 In the following link, genome file for GRCh38 of RefSeq could be downloaded.
 * [Human (hg38)](https://hgdownload.soe.ucsc.edu/goldenPath/archive/hg38/ncbiRefSeq/109.20211119/hg38.109.20211119.ncbiRefSeq.gtf.gz)
+
+In the following link, test file could be downloaded.
+* [Test data](https://sra-downloadb.be-md.ncbi.nlm.nih.gov/sos3/sra-pub-zq-22/SRR007/647/SRR7647801.sralite.1)
 
 The following options are available in this part: 
 * --input_file/-i: A BAM file that would be used to predict IPA sites and it should be sorted by coordinates.
@@ -64,8 +67,7 @@ InPACT_transcript --predict_terminal predict.result.txt --annotated_gtf RefSeq.g
 ```
 InPACT_quantify --transcript_tpm quant.sf --annotation_file merged.gtf --ipa_info predict.result.txt --save_file ipa_usage.txt
 ```
-
-The final output format is as follows:
+InPACT takes about an hour to run the test file using five cores. The final output format is as follows:
 
 Column | Description
 ------ | -----------

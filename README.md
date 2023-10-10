@@ -1,6 +1,6 @@
 # InPACT
 
-InPACT is a novel method designed to identify and quantify IPA sites via the examination of contextual sequence patterns and RNA-seq reads alignment. InPACT includes following parts:
+InPACT is a computational method designed to identify and quantify IPA sites via the examination of contextual sequence patterns and RNA-seq reads alignment. InPACT includes following parts:
 
 * Identify skipped and composite IPA sites.
 * Infer novel IPA transcripts.

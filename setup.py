@@ -23,7 +23,7 @@ setup(name = 'InPACT',
                         'numpy == 1.19.5',
                         'pybedtools  == 0.9.0',
                         'HTseq == 0.9.1',
-                        'scikit-learn == 0.24.2',
+                        'scikit-learn == 1.0.1',
                         'imbalanced-learn == 0.8.1',
                         'joblib == 1.1.0',
                         'pyfasta == 0.5.2' 

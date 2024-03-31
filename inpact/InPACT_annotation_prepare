@@ -327,7 +327,7 @@ def create_parser(name):
 args = sys.argv
 parser = create_parser(args[0])
 args = parser.parse_args(args[1:])
-log.info("#"*25 + "Start : Date preparation" + "#"*25)
+log.info("#"*25 + "Start : Data preparation" + "#"*25)
 # varialbe
 save_dir = args.output
 gtf_file_path = args.annotation_file
@@ -345,6 +345,6 @@ gene_exon_file = os.path.join(save_dir,"4.gene.exon.coordinate.json")
 union_exon_len = os.path.join(save_dir,"5.gene.exon.length.json")
 exon_df = extraExon(gtf_file_path)
 geneExons(exon_df,gene_exon_file,union_exon_len)
-log.info("#"*25 + "Done : Date preparation" + "#"*25 + "\n\n")
+log.info("#"*25 + "Done : Data preparation" + "#"*25 + "\n\n")
 
 

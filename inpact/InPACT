@@ -91,7 +91,8 @@ terminalPredict(){
     gtf_file_path=$1
     bam_file_path=$2
     bam_id=$3    
-    
+
+    [ -d $bam_id ] || mkdir $bam_id
     # data preparation
     echo Prepare annotation files
     annot_dir=${bam_id}/0.data_prepare

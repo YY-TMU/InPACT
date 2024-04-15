@@ -30,7 +30,7 @@ InPACT -h
 
 Based on the human reference genome (GRCh38), we provided an annotation of potential IPA sites predicted from the sequence module that could be used directly.
 
-In the following link, genome file for GRCh38 of RefSeq could be downloaded.
+In the following link, annotation file for GRCh38 of RefSeq could be downloaded.
 * [Human (hg38)](https://hgdownload.soe.ucsc.edu/goldenPath/archive/hg38/ncbiRefSeq/109.20211119/hg38.109.20211119.ncbiRefSeq.gtf.gz)
 
 In the following link, test file could be downloaded.

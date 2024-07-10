@@ -105,6 +105,7 @@ ipa_usage_dic = calculate_usage(transcript_tpm_path,
                                 novel_trans_te_dic)
 ipa_info_df = pd.read_table(ipa_info_path)
 ipa_info_df["Usage"] = [ipa_usage_dic[x] for x in ipa_info_df["region"]]
+ipa_info_df.columns = ["Terminal exon","IPA type","Gene","Upstream coordinate","PolyAsite","IPA usage"]
 save_file = os.path.join(save_dir,save_file)
 ipa_info_df.to_csv(save_file,sep="\t",index=False,header=True)
 log.info("Save %s" % save_file)

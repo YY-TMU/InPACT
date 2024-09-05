@@ -63,8 +63,21 @@ InPACT_transcript --predict_terminal predict.result.txt --annotated_gtf RefSeq.g
 
 [Salmon](https://github.com/COMBINE-lab/salmon) is used to index and quantify the transcriptome, and then the usage is calculated. 
 
+
+
 **Command**
 ```
+# Salmon
+# Extract the sequence of transcripts using gffread
+gffread merged.gtf -g genome.fa -w transcripts.fa
+# Build index
+salmon index -t transcripts.fa -i transcripts_index -k 31
+# For single-end reads, pass them to Salmon with the -r flag like:
+salmon quant -i transcripts_index -l <LIBTYPE> -r reads.fq --validateMappings -o transcripts_quant
+# For paired-end reads, pass them to Salmon with the -r flag like:
+salmon quant -i transcripts_index -l <LIBTYPE> -1 reads1.fq -2 reads2.fq --validateMappings -o transcripts_quant
+
+# calculate Usage
 InPACT_quantify --transcript_tpm quant.sf --annotation_file merged.gtf --ipa_info predict.result.txt --save_file ipa_usage.txt
 ```
 

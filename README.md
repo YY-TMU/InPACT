@@ -61,7 +61,7 @@ InPACT_transcript --predict_terminal predict.result.txt --annotated_gtf RefSeq.g
 
 ### 3.Calculate usage of IPA sites
 
-[Salmon](https://github.com/COMBINE-lab/salmon) is used to index and quantify the transcriptome, and then the usage is calculated. 
+[gffread](http://cole-trapnell-lab.github.io/cufflinks/assets/downloads/cufflinks-2.2.1.Linux_x86_64.tar.gz) and [salmon](https://github.com/COMBINE-lab/salmon) is used to index and quantify the transcriptome, and then the usage is calculated. 
 
 
 
